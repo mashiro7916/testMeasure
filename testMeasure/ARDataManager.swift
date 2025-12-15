@@ -40,17 +40,18 @@ class ARDataManager: ObservableObject {
         
         frameCount += 1
         let pixelBuffer = frame.capturedImage
+        let currentFrameNumber = frameCount
         
         // Save RGB image
-        saveRGBImage(pixelBuffer: pixelBuffer, frameNumber: frameCount, directory: baseDir)
+        saveRGBImage(pixelBuffer: pixelBuffer, frameNumber: currentFrameNumber, directory: baseDir)
         
         // Estimate depth using Core ML model
         depthModelManager.estimateDepth(from: pixelBuffer) { [weak self] depthMap in
             guard let self = self, let depthMap = depthMap else {
-                print("DEBUG: Failed to estimate depth for frame \(self.frameCount)")
+                print("DEBUG: Failed to estimate depth for frame \(currentFrameNumber)")
                 return
             }
-            self.saveDepthData(depthMap: depthMap, frameNumber: self.frameCount, directory: baseDir)
+            self.saveDepthData(depthMap: depthMap, frameNumber: currentFrameNumber, directory: baseDir)
         }
     }
     
