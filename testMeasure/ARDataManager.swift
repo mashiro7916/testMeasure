@@ -122,6 +122,44 @@ class ARDataManager: ObservableObject {
         }
     }
     
+    private func depthToColor(_ normalizedDepth: Float) -> (UInt8, UInt8, UInt8) {
+        // Convert normalized depth (0.0 to 1.0) to RGB color using rainbow colormap
+        // Red (near) -> Yellow -> Green -> Cyan -> Blue (far)
+        let value = max(0.0, min(1.0, normalizedDepth))
+        
+        let r: UInt8
+        let g: UInt8
+        let b: UInt8
+        
+        if value < 0.25 {
+            // Red to Yellow
+            let t = value / 0.25
+            r = 255
+            g = UInt8(t * 255)
+            b = 0
+        } else if value < 0.5 {
+            // Yellow to Green
+            let t = (value - 0.25) / 0.25
+            r = UInt8((1.0 - t) * 255)
+            g = 255
+            b = 0
+        } else if value < 0.75 {
+            // Green to Cyan
+            let t = (value - 0.5) / 0.25
+            r = 0
+            g = 255
+            b = UInt8(t * 255)
+        } else {
+            // Cyan to Blue
+            let t = (value - 0.75) / 0.25
+            r = 0
+            g = UInt8((1.0 - t) * 255)
+            b = 255
+        }
+        
+        return (r, g, b)
+    }
+    
     private func upsampleDepthMap(_ depthMap: CVPixelBuffer, toWidth width: Int, height: Int) -> CVPixelBuffer? {
         let sourceWidth = CVPixelBufferGetWidth(depthMap)
         let sourceHeight = CVPixelBufferGetHeight(depthMap)
@@ -198,6 +236,44 @@ class ARDataManager: ObservableObject {
             print("DEBUG: Saved depth data: \(depthPath.lastPathComponent) (size: \(width)x\(height), target: \(targetWidth)x\(targetHeight))")
         } catch {
             print("DEBUG: Failed to save depth data: \(error)")
+        }
+        
+        // Save depth map as colored PNG image for visualization
+        if !depthValues.isEmpty {
+            let minDepth = depthValues.min() ?? 0
+            let maxDepth = depthValues.max() ?? 1
+            let range = maxDepth - minDepth
+            
+            // Create RGB color image from depth values using rainbow colormap
+            var rgbPixels: [UInt8] = []
+            rgbPixels.reserveCapacity(depthValues.count * 4)  // RGBA
+            
+            for depth in depthValues {
+                let normalized = range > 0 ? ((depth - minDepth) / range) : 0
+                let (r, g, b) = depthToColor(normalized)
+                rgbPixels.append(r)
+                rgbPixels.append(g)
+                rgbPixels.append(b)
+                rgbPixels.append(255)  // Alpha
+            }
+            
+            // Create RGB image from color pixels
+            let colorSpace = CGColorSpaceCreateDeviceRGB()
+            rgbPixels.withUnsafeMutableBytes { bytes in
+                if let context = CGContext(data: bytes.baseAddress, width: width, height: height, bitsPerComponent: 8, bytesPerRow: width * 4, space: colorSpace, bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue),
+                   let cgImage = context.makeImage() {
+                    let uiImage = UIImage(cgImage: cgImage)
+                    if let imageData = uiImage.pngData() {
+                        let imagePath = directory.appendingPathComponent("depth_image_\(String(format: "%06d", frameNumber)).png")
+                        do {
+                            try imageData.write(to: imagePath)
+                            print("DEBUG: Saved depth image: \(imagePath.lastPathComponent) (size: \(width)x\(height))")
+                        } catch {
+                            print("DEBUG: Failed to save depth image: \(error)")
+                        }
+                    }
+                }
+            }
         }
     }
 }
