@@ -88,7 +88,7 @@ class ARDataManager: ObservableObject {
             
             // Save depth data: original size and upsampled to RGB resolution
             DispatchQueue.global(qos: .utility).async {
-                self.saveDepthData(depthMap: depthMap, frameNumber: currentFrameNumber, directory: baseDir, targetWidth: rgbWidth, targetHeight: rgbHeight)
+                self.saveDepthData(depthMap: depthMap, frameNumber: currentFrameNumber, directory: baseDir, targetWidth: rgbWidth, targetHeight: rgbHeight, rgbPixelBuffer: rgbBuffer)
             }
         }
     }
@@ -260,7 +260,7 @@ class ARDataManager: ObservableObject {
         return outputBuffer
     }
     
-    private func saveDepthData(depthMap: CVPixelBuffer, frameNumber: Int, directory: URL, targetWidth: Int, targetHeight: Int) {
+    private func saveDepthData(depthMap: CVPixelBuffer, frameNumber: Int, directory: URL, targetWidth: Int, targetHeight: Int, rgbPixelBuffer: CVPixelBuffer) {
         CVPixelBufferLockBaseAddress(depthMap, .readOnly)
         defer { CVPixelBufferUnlockBaseAddress(depthMap, .readOnly) }
         
@@ -320,7 +320,7 @@ class ARDataManager: ObservableObject {
             
             // Upsample depth map to RGB resolution using Lanczos and save
             if let upsampledDepth = upsampleDepthMapLanczos(depthMap, toWidth: targetWidth, height: targetHeight) {
-                saveUpsampledDepthData(depthMap: upsampledDepth, frameNumber: frameNumber, directory: directory, targetWidth: targetWidth, targetHeight: targetHeight)
+                saveUpsampledDepthData(depthMap: upsampledDepth, frameNumber: frameNumber, directory: directory, targetWidth: targetWidth, targetHeight: targetHeight, rgbPixelBuffer: rgbPixelBuffer)
             }
         }
     }
@@ -367,7 +367,7 @@ class ARDataManager: ObservableObject {
         return outputBuffer
     }
     
-    private func saveUpsampledDepthData(depthMap: CVPixelBuffer, frameNumber: Int, directory: URL, targetWidth: Int, targetHeight: Int) {
+    private func saveUpsampledDepthData(depthMap: CVPixelBuffer, frameNumber: Int, directory: URL, targetWidth: Int, targetHeight: Int, rgbPixelBuffer: CVPixelBuffer) {
         CVPixelBufferLockBaseAddress(depthMap, .readOnly)
         defer { CVPixelBufferUnlockBaseAddress(depthMap, .readOnly) }
         
@@ -392,13 +392,13 @@ class ARDataManager: ObservableObject {
             }
         }
         
-        // Save upsampled depth map as grayscale PNG image
+        // Create composite image: RGB on left, depth map on right
         if !depthValues.isEmpty {
+            // Convert depth map to grayscale UIImage
             let minDepth = depthValues.min() ?? 0
             let maxDepth = depthValues.max() ?? 1
             let range = maxDepth - minDepth
             
-            // Normalize depth values to 0-255 for grayscale visualization
             var grayscalePixels: [UInt8] = []
             grayscalePixels.reserveCapacity(depthValues.count)
             
@@ -407,21 +407,55 @@ class ARDataManager: ObservableObject {
                 grayscalePixels.append(UInt8(max(0, min(255, normalized * 255.0))))
             }
             
-            // Create grayscale image from normalized depth values
             let colorSpace = CGColorSpaceCreateDeviceGray()
-            grayscalePixels.withUnsafeMutableBytes { bytes in
-                if let context = CGContext(data: bytes.baseAddress, width: width, height: height, bitsPerComponent: 8, bytesPerRow: width, space: colorSpace, bitmapInfo: CGImageAlphaInfo.none.rawValue),
-                   let cgImage = context.makeImage() {
-                    let uiImage = UIImage(cgImage: cgImage)
-                    if let imageData = uiImage.pngData() {
-                        let imagePath = directory.appendingPathComponent("depth_image_upsampled_\(String(format: "%06d", frameNumber)).png")
-                        do {
-                            try imageData.write(to: imagePath)
-                            print("DEBUG: Saved upsampled depth grayscale image: \(imagePath.lastPathComponent) (size: \(width)x\(height))")
-                        } catch {
-                            print("DEBUG: Failed to save upsampled depth image: \(error)")
-                        }
-                    }
+            guard let depthCGImage = grayscalePixels.withUnsafeMutableBytes({ bytes -> CGImage? in
+                guard let context = CGContext(data: bytes.baseAddress, width: width, height: height, bitsPerComponent: 8, bytesPerRow: width, space: colorSpace, bitmapInfo: CGImageAlphaInfo.none.rawValue) else {
+                    return nil
+                }
+                return context.makeImage()
+            }) else {
+                print("DEBUG: Failed to create depth CGImage")
+                return
+            }
+            
+            let depthUIImage = UIImage(cgImage: depthCGImage)
+            
+            // Convert RGB pixel buffer to UIImage
+            let rgbCIImage = CIImage(cvPixelBuffer: rgbPixelBuffer)
+            let context = CIContext()
+            guard let rgbCGImage = context.createCGImage(rgbCIImage, from: rgbCIImage.extent) else {
+                print("DEBUG: Failed to create RGB CGImage")
+                return
+            }
+            let rgbUIImage = UIImage(cgImage: rgbCGImage)
+            
+            // Create composite image (side by side: RGB left, depth right)
+            let compositeWidth = width * 2
+            let compositeHeight = height
+            let compositeSize = CGSize(width: compositeWidth, height: compositeHeight)
+            
+            UIGraphicsBeginImageContextWithOptions(compositeSize, false, 1.0)
+            defer { UIGraphicsEndImageContext() }
+            
+            // Draw RGB image on the left
+            rgbUIImage.draw(in: CGRect(x: 0, y: 0, width: width, height: height))
+            
+            // Draw depth map on the right
+            depthUIImage.draw(in: CGRect(x: width, y: 0, width: width, height: height))
+            
+            guard let compositeImage = UIGraphicsGetImageFromCurrentImageContext() else {
+                print("DEBUG: Failed to create composite image")
+                return
+            }
+            
+            // Save composite image
+            if let imageData = compositeImage.pngData() {
+                let imagePath = directory.appendingPathComponent("composite_\(String(format: "%06d", frameNumber)).png")
+                do {
+                    try imageData.write(to: imagePath)
+                    print("DEBUG: Saved composite image (RGB + Depth): \(imagePath.lastPathComponent) (size: \(compositeWidth)x\(compositeHeight))")
+                } catch {
+                    print("DEBUG: Failed to save composite image: \(error)")
                 }
             }
         }
