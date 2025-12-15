@@ -84,11 +84,11 @@ class ARDataManager: ObservableObject {
             // Check depth map resolution (model output size)
             let depthWidth = CVPixelBufferGetWidth(depthMap)
             let depthHeight = CVPixelBufferGetHeight(depthMap)
-            print("DEBUG: Depth map size: \(depthWidth)x\(depthHeight) (model output)")
+            print("DEBUG: Depth map size: \(depthWidth)x\(depthHeight) (model output), RGB size: \(rgbWidth)x\(rgbHeight)")
             
-            // Save depth data directly without upsampling
+            // Save depth data: original size and upsampled to RGB resolution
             DispatchQueue.global(qos: .utility).async {
-                self.saveDepthData(depthMap: depthMap, frameNumber: currentFrameNumber, directory: baseDir)
+                self.saveDepthData(depthMap: depthMap, frameNumber: currentFrameNumber, directory: baseDir, targetWidth: rgbWidth, targetHeight: rgbHeight)
             }
         }
     }
@@ -260,7 +260,7 @@ class ARDataManager: ObservableObject {
         return outputBuffer
     }
     
-    private func saveDepthData(depthMap: CVPixelBuffer, frameNumber: Int, directory: URL) {
+    private func saveDepthData(depthMap: CVPixelBuffer, frameNumber: Int, directory: URL, targetWidth: Int, targetHeight: Int) {
         CVPixelBufferLockBaseAddress(depthMap, .readOnly)
         defer { CVPixelBufferUnlockBaseAddress(depthMap, .readOnly) }
         
@@ -283,17 +283,6 @@ class ARDataManager: ObservableObject {
             for x in 0..<width {
                 depthValues.append(rowStart[x])
             }
-        }
-        
-        // Save depth data as binary file
-        let depthPath = directory.appendingPathComponent("depth_frame_\(String(format: "%06d", frameNumber)).bin")
-        
-        do {
-            let data = Data(bytes: depthValues, count: depthValues.count * MemoryLayout<Float>.size)
-            try data.write(to: depthPath)
-            print("DEBUG: Saved depth data: \(depthPath.lastPathComponent) (size: \(width)x\(height))")
-        } catch {
-            print("DEBUG: Failed to save depth data: \(error)")
         }
         
         // Save depth map as grayscale PNG image (model output directly)
@@ -321,9 +310,116 @@ class ARDataManager: ObservableObject {
                         let imagePath = directory.appendingPathComponent("depth_image_\(String(format: "%06d", frameNumber)).png")
                         do {
                             try imageData.write(to: imagePath)
-                            print("DEBUG: Saved depth grayscale image: \(imagePath.lastPathComponent) (size: \(width)x\(height))")
+                            print("DEBUG: Saved depth grayscale image (original): \(imagePath.lastPathComponent) (size: \(width)x\(height))")
                         } catch {
                             print("DEBUG: Failed to save depth image: \(error)")
+                        }
+                    }
+                }
+            }
+            
+            // Upsample depth map to RGB resolution using Lanczos and save
+            if let upsampledDepth = upsampleDepthMapLanczos(depthMap, toWidth: targetWidth, height: targetHeight) {
+                saveUpsampledDepthData(depthMap: upsampledDepth, frameNumber: frameNumber, directory: directory, targetWidth: targetWidth, targetHeight: targetHeight)
+            }
+        }
+    }
+    
+    private func upsampleDepthMapLanczos(_ depthMap: CVPixelBuffer, toWidth width: Int, height: Int) -> CVPixelBuffer? {
+        let sourceWidth = CVPixelBufferGetWidth(depthMap)
+        let sourceHeight = CVPixelBufferGetHeight(depthMap)
+        
+        // If already the same size, return original
+        if sourceWidth == width && sourceHeight == height {
+            return depthMap
+        }
+        
+        // Create output pixel buffer
+        var outputPixelBuffer: CVPixelBuffer?
+        let status = CVPixelBufferCreate(
+            kCFAllocatorDefault,
+            width,
+            height,
+            kCVPixelFormatType_DepthFloat32,
+            nil,
+            &outputPixelBuffer
+        )
+        
+        guard status == kCVReturnSuccess, let outputBuffer = outputPixelBuffer else {
+            print("DEBUG: Failed to create output pixel buffer for Lanczos upsampling")
+            return nil
+        }
+        
+        // Use Core Image with high-quality interpolation (Lanczos)
+        let ciImage = CIImage(cvPixelBuffer: depthMap)
+        
+        // Create scale transform
+        let scaleX = CGFloat(width) / CGFloat(sourceWidth)
+        let scaleY = CGFloat(height) / CGFloat(sourceHeight)
+        let transform = CGAffineTransform(scaleX: scaleX, y: scaleY)
+        let scaledImage = ciImage.transformed(by: transform)
+        
+        // Render with high-quality interpolation (Core Image uses Lanczos by default for high-quality scaling)
+        let context = CIContext(options: [.highQualityDownsample: true, .useSoftwareRenderer: false])
+        context.render(scaledImage, to: outputBuffer)
+        
+        print("DEBUG: Upsampled depth map using Lanczos from \(sourceWidth)x\(sourceHeight) to \(width)x\(height)")
+        return outputBuffer
+    }
+    
+    private func saveUpsampledDepthData(depthMap: CVPixelBuffer, frameNumber: Int, directory: URL, targetWidth: Int, targetHeight: Int) {
+        CVPixelBufferLockBaseAddress(depthMap, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(depthMap, .readOnly) }
+        
+        let width = CVPixelBufferGetWidth(depthMap)
+        let height = CVPixelBufferGetHeight(depthMap)
+        let bytesPerRow = CVPixelBufferGetBytesPerRow(depthMap)
+        let baseAddress = CVPixelBufferGetBaseAddress(depthMap)
+        
+        guard let baseAddr = baseAddress else {
+            print("DEBUG: Failed to get base address of upsampled depth map")
+            return
+        }
+        
+        // Read depth values as Float32
+        let buffer = baseAddr.assumingMemoryBound(to: Float32.self)
+        var depthValues: [Float] = []
+        
+        for y in 0..<height {
+            let rowStart = buffer.advanced(by: y * (bytesPerRow / MemoryLayout<Float32>.size))
+            for x in 0..<width {
+                depthValues.append(rowStart[x])
+            }
+        }
+        
+        // Save upsampled depth map as grayscale PNG image
+        if !depthValues.isEmpty {
+            let minDepth = depthValues.min() ?? 0
+            let maxDepth = depthValues.max() ?? 1
+            let range = maxDepth - minDepth
+            
+            // Normalize depth values to 0-255 for grayscale visualization
+            var grayscalePixels: [UInt8] = []
+            grayscalePixels.reserveCapacity(depthValues.count)
+            
+            for depth in depthValues {
+                let normalized = range > 0 ? ((depth - minDepth) / range) : 0
+                grayscalePixels.append(UInt8(max(0, min(255, normalized * 255.0))))
+            }
+            
+            // Create grayscale image from normalized depth values
+            let colorSpace = CGColorSpaceCreateDeviceGray()
+            grayscalePixels.withUnsafeMutableBytes { bytes in
+                if let context = CGContext(data: bytes.baseAddress, width: width, height: height, bitsPerComponent: 8, bytesPerRow: width, space: colorSpace, bitmapInfo: CGImageAlphaInfo.none.rawValue),
+                   let cgImage = context.makeImage() {
+                    let uiImage = UIImage(cgImage: cgImage)
+                    if let imageData = uiImage.pngData() {
+                        let imagePath = directory.appendingPathComponent("depth_image_upsampled_\(String(format: "%06d", frameNumber)).png")
+                        do {
+                            try imageData.write(to: imagePath)
+                            print("DEBUG: Saved upsampled depth grayscale image: \(imagePath.lastPathComponent) (size: \(width)x\(height))")
+                        } catch {
+                            print("DEBUG: Failed to save upsampled depth image: \(error)")
                         }
                     }
                 }

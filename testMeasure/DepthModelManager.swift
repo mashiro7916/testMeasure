@@ -97,7 +97,7 @@ class DepthModelManager {
             
             do {
                 // Create feature provider
-                let inputFeature = try MLFeatureValue(image: modelInput)
+                let inputFeature = try MLFeatureValue(pixelBuffer: modelInput)
                 let provider = try MLDictionaryFeatureProvider(dictionary: [inputName: inputFeature])
                 
                 // Perform prediction
