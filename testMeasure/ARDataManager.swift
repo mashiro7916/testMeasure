@@ -10,6 +10,7 @@ import ARKit
 import UIKit
 import AVFoundation
 import CoreVideo
+import Accelerate
 
 class ARDataManager: ObservableObject {
     private var frameCount: Int = 0
@@ -67,29 +68,27 @@ class ARDataManager: ObservableObject {
             self?.saveRGBImage(pixelBuffer: pixelBuffer, frameNumber: currentFrameNumber, directory: baseDir)
         }
         
-        // Estimate depth using Core ML model
-        depthModelManager.estimateDepth(from: pixelBuffer) { [weak self] depthMap in
+        // Convert YUV to RGB for model input
+        guard let rgbBuffer = convertYUVToRGB(pixelBuffer) else {
+            print("DEBUG: Failed to convert YUV to RGB")
+            return
+        }
+        
+        // Estimate depth using Core ML model with RGB input
+        depthModelManager.estimateDepth(from: rgbBuffer) { [weak self] depthMap in
             guard let self = self, let depthMap = depthMap else {
                 print("DEBUG: Failed to estimate depth for frame \(currentFrameNumber)")
                 return
             }
             
-            // Check depth map resolution
+            // Check depth map resolution (model output size)
             let depthWidth = CVPixelBufferGetWidth(depthMap)
             let depthHeight = CVPixelBufferGetHeight(depthMap)
-            print("DEBUG: Depth map size: \(depthWidth)x\(depthHeight), RGB size: \(rgbWidth)x\(rgbHeight)")
+            print("DEBUG: Depth map size: \(depthWidth)x\(depthHeight) (model output)")
             
-            // Upsample depth map to RGB resolution
-            if let upsampledDepth = self.upsampleDepthMap(depthMap, toWidth: rgbWidth, height: rgbHeight) {
-                // Save depth data on background queue
-                DispatchQueue.global(qos: .utility).async {
-                    self.saveDepthData(depthMap: upsampledDepth, frameNumber: currentFrameNumber, directory: baseDir, targetWidth: rgbWidth, targetHeight: rgbHeight)
-                }
-            } else {
-                print("DEBUG: Failed to upsample depth map, saving original size")
-                DispatchQueue.global(qos: .utility).async {
-                    self.saveDepthData(depthMap: depthMap, frameNumber: currentFrameNumber, directory: baseDir, targetWidth: depthWidth, targetHeight: depthHeight)
-                }
+            // Save depth data directly without upsampling
+            DispatchQueue.global(qos: .utility).async {
+                self.saveDepthData(depthMap: depthMap, frameNumber: currentFrameNumber, directory: baseDir)
             }
         }
     }
@@ -160,6 +159,40 @@ class ARDataManager: ObservableObject {
         return (r, g, b)
     }
     
+    private func convertYUVToRGB(_ yuvBuffer: CVPixelBuffer) -> CVPixelBuffer? {
+        let width = CVPixelBufferGetWidth(yuvBuffer)
+        let height = CVPixelBufferGetHeight(yuvBuffer)
+        let pixelFormat = CVPixelBufferGetPixelFormatType(yuvBuffer)
+        
+        // If already RGB, return as is
+        if pixelFormat == kCVPixelFormatType_32BGRA || pixelFormat == kCVPixelFormatType_32ARGB {
+            return yuvBuffer
+        }
+        
+        // Create RGB output buffer
+        var rgbBuffer: CVPixelBuffer?
+        let status = CVPixelBufferCreate(
+            kCFAllocatorDefault,
+            width,
+            height,
+            kCVPixelFormatType_32BGRA,
+            nil,
+            &rgbBuffer
+        )
+        
+        guard status == kCVReturnSuccess, let outputBuffer = rgbBuffer else {
+            print("DEBUG: Failed to create RGB pixel buffer")
+            return nil
+        }
+        
+        // Use Core Image to convert YUV to RGB
+        let ciImage = CIImage(cvPixelBuffer: yuvBuffer)
+        let context = CIContext()
+        context.render(ciImage, to: outputBuffer)
+        
+        return outputBuffer
+    }
+    
     private func upsampleDepthMap(_ depthMap: CVPixelBuffer, toWidth width: Int, height: Int) -> CVPixelBuffer? {
         let sourceWidth = CVPixelBufferGetWidth(depthMap)
         let sourceHeight = CVPixelBufferGetHeight(depthMap)
@@ -168,15 +201,6 @@ class ARDataManager: ObservableObject {
         if sourceWidth == width && sourceHeight == height {
             return depthMap
         }
-        
-        // Create CIImage from depth map
-        let ciImage = CIImage(cvPixelBuffer: depthMap)
-        
-        // Create transform to scale to target size
-        let scaleX = CGFloat(width) / CGFloat(sourceWidth)
-        let scaleY = CGFloat(height) / CGFloat(sourceHeight)
-        let transform = CGAffineTransform(scaleX: scaleX, y: scaleY)
-        let scaledImage = ciImage.transformed(by: transform)
         
         // Create output pixel buffer
         var outputPixelBuffer: CVPixelBuffer?
@@ -194,15 +218,49 @@ class ARDataManager: ObservableObject {
             return nil
         }
         
-        // Render scaled image to output buffer
-        let context = CIContext()
-        context.render(scaledImage, to: outputBuffer)
+        // Use vImage for high-quality bilinear interpolation
+        CVPixelBufferLockBaseAddress(depthMap, .readOnly)
+        CVPixelBufferLockBaseAddress(outputBuffer, [])
+        defer {
+            CVPixelBufferUnlockBaseAddress(depthMap, .readOnly)
+            CVPixelBufferUnlockBaseAddress(outputBuffer, [])
+        }
+        
+        guard let sourceBase = CVPixelBufferGetBaseAddress(depthMap),
+              let destBase = CVPixelBufferGetBaseAddress(outputBuffer) else {
+            return nil
+        }
+        
+        let sourceBytesPerRow = CVPixelBufferGetBytesPerRow(depthMap)
+        let destBytesPerRow = CVPixelBufferGetBytesPerRow(outputBuffer)
+        
+        var sourceBuffer = vImage_Buffer(
+            data: sourceBase,
+            height: vImagePixelCount(sourceHeight),
+            width: vImagePixelCount(sourceWidth),
+            rowBytes: sourceBytesPerRow
+        )
+        
+        var destBuffer = vImage_Buffer(
+            data: destBase,
+            height: vImagePixelCount(height),
+            width: vImagePixelCount(width),
+            rowBytes: destBytesPerRow
+        )
+        
+        // Use high-quality scaling for depth values
+        let error = vImageScale_PlanarF(&sourceBuffer, &destBuffer, nil, vImage_Flags(kvImageHighQualityResampling))
+        
+        if error != kvImageNoError {
+            print("DEBUG: vImage depth scaling failed with error: \(error)")
+            return nil
+        }
         
         print("DEBUG: Upsampled depth map from \(sourceWidth)x\(sourceHeight) to \(width)x\(height)")
         return outputBuffer
     }
     
-    private func saveDepthData(depthMap: CVPixelBuffer, frameNumber: Int, directory: URL, targetWidth: Int, targetHeight: Int) {
+    private func saveDepthData(depthMap: CVPixelBuffer, frameNumber: Int, directory: URL) {
         CVPixelBufferLockBaseAddress(depthMap, .readOnly)
         defer { CVPixelBufferUnlockBaseAddress(depthMap, .readOnly) }
         
@@ -233,41 +291,37 @@ class ARDataManager: ObservableObject {
         do {
             let data = Data(bytes: depthValues, count: depthValues.count * MemoryLayout<Float>.size)
             try data.write(to: depthPath)
-            print("DEBUG: Saved depth data: \(depthPath.lastPathComponent) (size: \(width)x\(height), target: \(targetWidth)x\(targetHeight))")
+            print("DEBUG: Saved depth data: \(depthPath.lastPathComponent) (size: \(width)x\(height))")
         } catch {
             print("DEBUG: Failed to save depth data: \(error)")
         }
         
-        // Save depth map as colored PNG image for visualization
+        // Save depth map as grayscale PNG image (model output directly)
         if !depthValues.isEmpty {
             let minDepth = depthValues.min() ?? 0
             let maxDepth = depthValues.max() ?? 1
             let range = maxDepth - minDepth
             
-            // Create RGB color image from depth values using rainbow colormap
-            var rgbPixels: [UInt8] = []
-            rgbPixels.reserveCapacity(depthValues.count * 4)  // RGBA
+            // Normalize depth values to 0-255 for grayscale visualization
+            var grayscalePixels: [UInt8] = []
+            grayscalePixels.reserveCapacity(depthValues.count)
             
             for depth in depthValues {
                 let normalized = range > 0 ? ((depth - minDepth) / range) : 0
-                let (r, g, b) = depthToColor(normalized)
-                rgbPixels.append(r)
-                rgbPixels.append(g)
-                rgbPixels.append(b)
-                rgbPixels.append(255)  // Alpha
+                grayscalePixels.append(UInt8(max(0, min(255, normalized * 255.0))))
             }
             
-            // Create RGB image from color pixels
-            let colorSpace = CGColorSpaceCreateDeviceRGB()
-            rgbPixels.withUnsafeMutableBytes { bytes in
-                if let context = CGContext(data: bytes.baseAddress, width: width, height: height, bitsPerComponent: 8, bytesPerRow: width * 4, space: colorSpace, bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue),
+            // Create grayscale image from normalized depth values
+            let colorSpace = CGColorSpaceCreateDeviceGray()
+            grayscalePixels.withUnsafeMutableBytes { bytes in
+                if let context = CGContext(data: bytes.baseAddress, width: width, height: height, bitsPerComponent: 8, bytesPerRow: width, space: colorSpace, bitmapInfo: CGImageAlphaInfo.none.rawValue),
                    let cgImage = context.makeImage() {
                     let uiImage = UIImage(cgImage: cgImage)
                     if let imageData = uiImage.pngData() {
                         let imagePath = directory.appendingPathComponent("depth_image_\(String(format: "%06d", frameNumber)).png")
                         do {
                             try imageData.write(to: imagePath)
-                            print("DEBUG: Saved depth image: \(imagePath.lastPathComponent) (size: \(width)x\(height))")
+                            print("DEBUG: Saved depth grayscale image: \(imagePath.lastPathComponent) (size: \(width)x\(height))")
                         } catch {
                             print("DEBUG: Failed to save depth image: \(error)")
                         }
