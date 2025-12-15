@@ -15,13 +15,13 @@ class ARDataManager: ObservableObject {
     private var frameCount: Int = 0
     private let fileManager = FileManager.default
     private var baseDirectory: URL?
+    private let depthModelManager = DepthModelManager()
     
     init() {
         setupDirectory()
     }
     
     private func setupDirectory() {
-        // Create directory in Documents/testMeasure folder
         let documentsPath = fileManager.urls(for: .documentDirectory, in: .userDomainMask)[0]
         baseDirectory = documentsPath.appendingPathComponent("testMeasure")
         
@@ -39,18 +39,22 @@ class ARDataManager: ObservableObject {
         guard let baseDir = baseDirectory else { return }
         
         frameCount += 1
-        
-        // Save RGB image
-        saveRGBImage(frame: frame, frameNumber: frameCount, directory: baseDir)
-        
-        // Save LiDAR depth data
-        saveDepthData(frame: frame, frameNumber: frameCount, directory: baseDir)
-    }
-    
-    private func saveRGBImage(frame: ARFrame, frameNumber: Int, directory: URL) {
         let pixelBuffer = frame.capturedImage
         
-        // Convert CVPixelBuffer to UIImage
+        // Save RGB image
+        saveRGBImage(pixelBuffer: pixelBuffer, frameNumber: frameCount, directory: baseDir)
+        
+        // Estimate depth using Core ML model
+        depthModelManager.estimateDepth(from: pixelBuffer) { [weak self] depthMap in
+            guard let self = self, let depthMap = depthMap else {
+                print("DEBUG: Failed to estimate depth for frame \(self.frameCount)")
+                return
+            }
+            self.saveDepthData(depthMap: depthMap, frameNumber: self.frameCount, directory: baseDir)
+        }
+    }
+    
+    private func saveRGBImage(pixelBuffer: CVPixelBuffer, frameNumber: Int, directory: URL) {
         let ciImage = CIImage(cvPixelBuffer: pixelBuffer)
         let context = CIContext()
         
@@ -60,8 +64,6 @@ class ARDataManager: ObservableObject {
         }
         
         let uiImage = UIImage(cgImage: cgImage)
-        
-        // Save as PNG
         let imagePath = directory.appendingPathComponent("rgb_frame_\(String(format: "%06d", frameNumber)).png")
         
         guard let imageData = uiImage.pngData() else {
@@ -77,17 +79,7 @@ class ARDataManager: ObservableObject {
         }
     }
     
-    private func saveDepthData(frame: ARFrame, frameNumber: Int, directory: URL) {
-        // Get scene depth data from ARFrame
-        guard let sceneDepth = frame.sceneDepth else {
-            print("DEBUG: No scene depth data available for frame \(frameNumber)")
-            return
-        }
-        
-        // Get depth map from ARDepthData
-        let depthMap = sceneDepth.depthMap
-        
-        // Convert depth map to array of Float values
+    private func saveDepthData(depthMap: CVPixelBuffer, frameNumber: Int, directory: URL) {
         CVPixelBufferLockBaseAddress(depthMap, .readOnly)
         defer { CVPixelBufferUnlockBaseAddress(depthMap, .readOnly) }
         
@@ -101,22 +93,15 @@ class ARDataManager: ObservableObject {
             return
         }
         
-        // Check pixel format - ARKit depth maps are typically kCVPixelFormatType_DepthFloat32
-        let pixelFormat = CVPixelBufferGetPixelFormatType(depthMap)
+        // Read depth values as Float32
+        let buffer = baseAddr.assumingMemoryBound(to: Float32.self)
         var depthValues: [Float] = []
         
-        if pixelFormat == kCVPixelFormatType_DepthFloat32 {
-            // Read depth values as Float32
-            let buffer = baseAddr.assumingMemoryBound(to: Float32.self)
-            for y in 0..<height {
-                let rowStart = buffer.advanced(by: y * (bytesPerRow / MemoryLayout<Float32>.size))
-                for x in 0..<width {
-                    depthValues.append(rowStart[x])
-                }
+        for y in 0..<height {
+            let rowStart = buffer.advanced(by: y * (bytesPerRow / MemoryLayout<Float32>.size))
+            for x in 0..<width {
+                depthValues.append(rowStart[x])
             }
-        } else {
-            print("DEBUG: Unsupported depth format: \(pixelFormat)")
-            return
         }
         
         // Save depth data as binary file
@@ -125,23 +110,9 @@ class ARDataManager: ObservableObject {
         do {
             let data = Data(bytes: depthValues, count: depthValues.count * MemoryLayout<Float>.size)
             try data.write(to: depthPath)
-            
-            // Also save metadata (width, height) as JSON
-            let metadata: [String: Any] = [
-                "width": width,
-                "height": height,
-                "frameNumber": frameNumber,
-                "timestamp": frame.timestamp
-            ]
-            
-            let metadataPath = directory.appendingPathComponent("depth_metadata_\(String(format: "%06d", frameNumber)).json")
-            let jsonData = try JSONSerialization.data(withJSONObject: metadata, options: .prettyPrinted)
-            try jsonData.write(to: metadataPath)
-            
             print("DEBUG: Saved depth data: \(depthPath.lastPathComponent) (size: \(width)x\(height))")
         } catch {
             print("DEBUG: Failed to save depth data: \(error)")
         }
     }
 }
-
