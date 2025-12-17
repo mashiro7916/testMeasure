@@ -87,7 +87,20 @@ class ARDataManager: ObservableObject {
         
         // Detect lines and calculate 3D distances
         if let rgbImage = pixelBufferToUIImage(rgbBuffer) {
-            detectLinesAndCalculateDistance(image: rgbImage)
+            // Rotate image 90 degrees clockwise to match camera orientation
+            if let rotatedImage = rotateImageClockwise90(rgbImage) {
+                // Store original resolution for coordinate transformation
+                let originalWidth = Float(resolution.width)
+                let originalHeight = Float(resolution.height)
+                
+                // Update imageResolution to rotated size
+                let rotatedSize = CGSize(width: resolution.height, height: resolution.width)
+                DispatchQueue.main.async {
+                    self.imageResolution = rotatedSize
+                }
+                
+                detectLinesAndCalculateDistance(image: rotatedImage, originalWidth: originalWidth, originalHeight: originalHeight)
+            }
         }
     }
     
@@ -124,7 +137,7 @@ class ARDataManager: ObservableObject {
     
     // MARK: - Line Detection and Distance Calculation
     
-    private func detectLinesAndCalculateDistance(image: UIImage) {
+    private func detectLinesAndCalculateDistance(image: UIImage, originalWidth: Float, originalHeight: Float) {
         // Detect lines using LSD
         let lines = OpenCVWrapper.detectLines(image)
         
@@ -145,9 +158,16 @@ class ARDataManager: ObservableObject {
         // Convert to Swift struct and calculate 3D distances
         var swiftLines: [DetectedLine] = []
         for (index, line) in lines.enumerated() {
+            // Convert rotated coordinates back to original image coordinates
+            // If image was rotated 90° clockwise: (x_rot, y_rot) -> (originalHeight - y_rot, x_rot)
+            let origX1 = originalHeight - line.y1
+            let origY1 = line.x1
+            let origX2 = originalHeight - line.y2
+            let origY2 = line.x2
+            
             let result = calculate3DCoordinates(
-                x1: line.x1, y1: line.y1,
-                x2: line.x2, y2: line.y2,
+                x1: origX1, y1: origY1,
+                x2: origX2, y2: origY2,
                 lidarDepth: lidarDepth,
                 intrinsics: intrinsics,
                 imageResolution: currentResolution
@@ -448,5 +468,32 @@ class ARDataManager: ObservableObject {
             return nil
         }
         return UIImage(cgImage: cgImage)
+    }
+    
+    // Rotate image 90 degrees clockwise
+    private func rotateImageClockwise90(_ image: UIImage) -> UIImage? {
+        let size = image.size
+        let rotatedSize = CGSize(width: size.height, height: size.width)
+        
+        UIGraphicsBeginImageContextWithOptions(rotatedSize, false, image.scale)
+        guard let context = UIGraphicsGetCurrentContext() else {
+            UIGraphicsEndImageContext()
+            return nil
+        }
+        
+        // Move origin to center
+        context.translateBy(x: rotatedSize.width / 2, y: rotatedSize.height / 2)
+        // Rotate 90 degrees clockwise
+        context.rotate(by: -CGFloat.pi / 2)
+        // Move origin back
+        context.translateBy(x: -size.width / 2, y: -size.height / 2)
+        
+        // Draw image
+        image.draw(at: .zero)
+        
+        let rotatedImage = UIGraphicsGetImageFromCurrentImageContext()
+        UIGraphicsEndImageContext()
+        
+        return rotatedImage
     }
 }
