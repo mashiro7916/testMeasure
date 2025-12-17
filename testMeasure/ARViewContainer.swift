@@ -37,7 +37,14 @@ struct ARViewContainer: UIViewRepresentable {
     
     func updateUIView(_ uiView: ARView, context: Context) {
         // Update 3D lines when detectedLines change
-        context.coordinator.updateLines(arManager.detectedLines, frame: arManager.currentFrame)
+        let currentLines = arManager.detectedLines
+        let currentFrame = arManager.currentFrame
+        
+        // Check if lines have changed
+        if currentLines.count != context.coordinator.lastLineCount {
+            context.coordinator.lastLineCount = currentLines.count
+            context.coordinator.updateLines(currentLines, frame: currentFrame)
+        }
     }
     
     func makeCoordinator() -> Coordinator {
@@ -48,6 +55,7 @@ struct ARViewContainer: UIViewRepresentable {
         var arManager: ARDataManager
         var arView: ARView?
         private var cameraAnchor: AnchorEntity?
+        private var lastLineCount: Int = -1
         
         init(arManager: ARDataManager) {
             self.arManager = arManager
@@ -59,11 +67,21 @@ struct ARViewContainer: UIViewRepresentable {
         }
         
         func updateLines(_ lines: [DetectedLine], frame: ARFrame?) {
-            guard let arView = arView else { return }
+            guard let arView = arView else {
+                print("DEBUG: ARView is nil, cannot update lines")
+                return
+            }
+            
+            print("DEBUG: updateLines called with \(lines.count) lines")
             
             // Remove old anchor if exists
             if let oldAnchor = cameraAnchor {
                 arView.scene.removeAnchor(oldAnchor)
+            }
+            
+            guard !lines.isEmpty else {
+                print("DEBUG: No lines to display")
+                return
             }
             
             // Create new anchor for lines (attached to camera)
@@ -73,15 +91,38 @@ struct ARViewContainer: UIViewRepresentable {
             
             // Create 3D line entities for each detected line
             // Points are already in camera coordinate system, so we can use them directly
-            for line in lines {
+            var entityCount = 0
+            for (index, line) in lines.enumerated() {
                 // Points are in camera coordinate system (X right, Y up, Z forward)
                 let point1 = line.point3D1
                 let point2 = line.point3D2
                 
+                // Check if points are in valid range (Z should be positive and reasonable)
+                let z1 = point1.z
+                let z2 = point2.z
+                
+                print("DEBUG: Line \(index): p1=\(point1), p2=\(point2), length=\(line.length3D)m, z1=\(z1)m, z2=\(z2)m")
+                
+                // Skip if depth is invalid or too far
+                if z1 <= 0 || z2 <= 0 || z1 > 10.0 || z2 > 10.0 {
+                    print("DEBUG: Line \(index) has invalid depth, skipping")
+                    continue
+                }
+                
                 // Create line entity
                 let lineEntity = createLineEntity(from: point1, to: point2, color: .yellow)
-                newCameraAnchor.addChild(lineEntity)
+                
+                // Check if entity was created successfully
+                if lineEntity.children.count > 0 || lineEntity.components[ModelComponent.self] != nil {
+                    newCameraAnchor.addChild(lineEntity)
+                    entityCount += 1
+                    print("DEBUG: Line \(index) entity created and added")
+                } else {
+                    print("DEBUG: Line \(index) entity creation failed")
+                }
             }
+            
+            print("DEBUG: Created \(entityCount) line entities and added to scene (total lines: \(lines.count))")
         }
         
         private func createLineEntity(from start: simd_float3, to end: simd_float3, color: UIColor) -> Entity {
@@ -89,19 +130,23 @@ struct ARViewContainer: UIViewRepresentable {
             let direction = end - start
             let length = simd_length(direction)
             
+            print("DEBUG: Creating line entity: start=\(start), end=\(end), length=\(length)m")
+            
             guard length > 0.001 else {
+                print("DEBUG: Line too short, skipping")
                 return Entity()
             }
             
             // Create a cylinder mesh for the line
             // Cylinder is created along Y-axis by default
-            let lineMesh = MeshResource.generateCylinder(height: length, radius: 0.003) // 3mm radius
+            let lineMesh = MeshResource.generateCylinder(height: length, radius: 0.005) // 5mm radius (increased for visibility)
             
-            // Create material with yellow color
+            // Create material with yellow color (bright and visible)
             var material = SimpleMaterial()
             material.color = .init(tint: color, texture: nil)
             material.metallic = 0.0
-            material.roughness = 0.5
+            material.roughness = 0.3  // Lower roughness for brighter appearance
+            material.isMetallic = false
             
             // Create model entity
             let lineEntity = ModelEntity(mesh: lineMesh, materials: [material])

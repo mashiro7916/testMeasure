@@ -173,6 +173,11 @@ class ARDataManager: ObservableObject {
         // Keep only top 10 lines (all must be > 10cm)
         let topLines = Array(swiftLines.prefix(10))
         
+        print("DEBUG: Detected \(lines.count) lines, \(swiftLines.count) lines > 10cm, keeping top \(topLines.count) lines")
+        if !topLines.isEmpty {
+            print("DEBUG: First line 3D points: p1=\(topLines[0].point3D1), p2=\(topLines[0].point3D2), length=\(topLines[0].length3D)m")
+        }
+        
         DispatchQueue.main.async {
             self.detectedLines = topLines
         }
