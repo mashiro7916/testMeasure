@@ -125,20 +125,36 @@ struct ARViewContainer: UIViewRepresentable {
                     continue
                 }
                 
+                // Verify points are in front of camera (Z should be positive in camera coordinate system)
+                if point1.z < 0.1 || point2.z < 0.1 {
+                    print("DEBUG: Line \(index) too close to camera (z < 0.1m), skipping")
+                    continue
+                }
+                
+                print("DEBUG: Line \(index) passed validation, creating entity with p1=\(point1), p2=\(point2)")
+                
                 // Create line entity
                 let lineEntity = createLineEntity(from: point1, to: point2, color: .yellow)
                 
                 // Check if entity was created successfully
-                if lineEntity.children.count > 0 || lineEntity.components[ModelComponent.self] != nil {
+                let hasModel = lineEntity.components[ModelComponent.self] != nil
+                let hasChildren = lineEntity.children.count > 0
+                print("DEBUG: Line \(index) entity check: hasModel=\(hasModel), hasChildren=\(hasChildren), position=\(lineEntity.position), orientation=\(lineEntity.orientation)")
+                
+                if hasModel || hasChildren {
                     newCameraAnchor.addChild(lineEntity)
                     entityCount += 1
-                    print("DEBUG: Line \(index) entity created and added")
+                    print("DEBUG: Line \(index) entity added to anchor. Anchor children count: \(newCameraAnchor.children.count)")
                 } else {
-                    print("DEBUG: Line \(index) entity creation failed")
+                    print("DEBUG: Line \(index) entity creation failed - no model component or children")
                 }
             }
             
             print("DEBUG: Created \(entityCount) line entities and added to scene (total lines: \(lines.count))")
+            print("DEBUG: Camera anchor position: \(newCameraAnchor.position), children: \(newCameraAnchor.children.count)")
+            
+            // Force scene update
+            arView.scene.update(deltaTime: 0.0)
         }
         
         private func createLineEntity(from start: simd_float3, to end: simd_float3, color: UIColor) -> Entity {
@@ -155,13 +171,14 @@ struct ARViewContainer: UIViewRepresentable {
             
             // Create a cylinder mesh for the line
             // Cylinder is created along Y-axis by default
-            let lineMesh = MeshResource.generateCylinder(height: length, radius: 0.005) // 5mm radius (increased for visibility)
+            // Increase radius significantly for better visibility
+            let lineMesh = MeshResource.generateCylinder(height: length, radius: 0.01) // 1cm radius (much more visible)
             
             // Create material with yellow color (bright and visible)
             var material = SimpleMaterial()
             material.color = .init(tint: color, texture: nil)
             material.metallic = 0.0
-            material.roughness = 0.3  // Lower roughness for brighter appearance
+            material.roughness = 0.1  // Very low roughness for very bright appearance
             
             // Create model entity
             let lineEntity = ModelEntity(mesh: lineMesh, materials: [material])
