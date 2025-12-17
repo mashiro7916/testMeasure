@@ -12,176 +12,392 @@ import AVFoundation
 import CoreVideo
 import Accelerate
 
+// Line segment data structure for Swift
+struct DetectedLine: Identifiable {
+    let id: Int
+    let x1: Float
+    let y1: Float
+    let x2: Float
+    let y2: Float
+    
+    var length2D: Float {
+        return sqrtf((x2 - x1) * (x2 - x1) + (y2 - y1) * (y2 - y1))
+    }
+}
+
 class ARDataManager: ObservableObject {
     private var frameCount: Int = 0
-    private var savedFrameCount: Int = 0
-    private let fileManager = FileManager.default
-    private var baseDirectory: URL?
     private let depthModelManager = DepthModelManager()
-    private let saveInterval: Int = 30  // Save every 30 frames (approximately 1 second at 30fps)
-    private var lastSaveTime: TimeInterval = 0
-    private let minSaveInterval: TimeInterval = 1.0  // Minimum 1 second between saves
+    private let processInterval: Int = 10  // Process every 10 frames for smoother UI
     
-    // Published property for displaying OpenCV grayscale image
-    @Published var opencvGrayscaleImage: UIImage?
+    // Camera intrinsics for 3D projection
+    private var cameraIntrinsics: simd_float3x3?
+    private var imageResolution: CGSize = .zero
+    
+    // Published properties for UI
+    @Published var displayImage: UIImage?
+    @Published var detectedLines: [DetectedLine] = []
+    @Published var selectedLineIndex: Int = -1
+    @Published var measuredLength: Float = 0.0  // in meters
+    @Published var isProcessing: Bool = false
+    
+    // Depth data
+    private var absoluteDepthMap: [Float]?  // Aligned absolute depth (meters)
+    private var depthWidth: Int = 0
+    private var depthHeight: Int = 0
     
     init() {
-        setupDirectory()
-    }
-    
-    private func setupDirectory() {
-        let documentsPath = fileManager.urls(for: .documentDirectory, in: .userDomainMask)[0]
-        baseDirectory = documentsPath.appendingPathComponent("testMeasure")
-        
-        guard let baseDir = baseDirectory else { return }
-        
-        do {
-            try fileManager.createDirectory(at: baseDir, withIntermediateDirectories: true)
-            print("DEBUG: Created directory at \(baseDir.path)")
-        } catch {
-            print("DEBUG: Failed to create directory: \(error)")
-        }
+        print("DEBUG: ARDataManager initialized")
     }
     
     func captureFrame(frame: ARFrame) {
-        guard let baseDir = baseDirectory else { return }
-        
         frameCount += 1
-        let currentTime = frame.timestamp
         
-        // Check if we should save this frame (based on frame count and time interval)
-        let shouldSave = (frameCount % saveInterval == 0) && (currentTime - lastSaveTime >= minSaveInterval)
-        
-        if !shouldSave {
+        // Only process every N frames
+        if frameCount % processInterval != 0 {
             return
         }
         
-        savedFrameCount += 1
-        lastSaveTime = currentTime
+        // Store camera intrinsics
+        cameraIntrinsics = frame.camera.intrinsics
         let pixelBuffer = frame.capturedImage
-        let currentFrameNumber = savedFrameCount
+        imageResolution = CGSize(
+            width: CVPixelBufferGetWidth(pixelBuffer),
+            height: CVPixelBufferGetHeight(pixelBuffer)
+        )
         
-        // Get RGB image dimensions for comparison
-        let rgbWidth = CVPixelBufferGetWidth(pixelBuffer)
-        let rgbHeight = CVPixelBufferGetHeight(pixelBuffer)
-        print("DEBUG: Capturing frame \(currentFrameNumber), RGB size: \(rgbWidth)x\(rgbHeight)")
+        // Get LiDAR depth if available
+        let lidarDepth = frame.sceneDepth?.depthMap
         
-        // Save RGB image on background queue
-        DispatchQueue.global(qos: .utility).async { [weak self] in
-            self?.saveRGBImage(pixelBuffer: pixelBuffer, frameNumber: currentFrameNumber, directory: baseDir)
-        }
-        
-        // Convert YUV to RGB for model input
+        // Convert YUV to RGB
         guard let rgbBuffer = convertYUVToRGB(pixelBuffer) else {
             print("DEBUG: Failed to convert YUV to RGB")
             return
         }
         
-        // OpenCV grayscale test - convert RGB to grayscale and display (not save)
-        if let rgbImage = pixelBufferToUIImage(rgbBuffer) {
-            let grayImage = OpenCVWrapper.convert(toGrayscale: rgbImage)
-            DispatchQueue.main.async { [weak self] in
-                self?.opencvGrayscaleImage = grayImage
-                print("DEBUG: OpenCV grayscale image updated, OpenCV version: \(OpenCVWrapper.openCVVersion())")
-            }
-        }
-        
-        // Estimate depth using Core ML model with RGB input
-        depthModelManager.estimateDepth(from: rgbBuffer) { [weak self] depthMap in
-            guard let self = self, let depthMap = depthMap else {
-                print("DEBUG: Failed to estimate depth for frame \(currentFrameNumber)")
+        // Run Depth Anything model
+        depthModelManager.estimateDepth(from: rgbBuffer) { [weak self] relativeDepthMap in
+            guard let self = self, let relativeDepth = relativeDepthMap else {
                 return
             }
             
-            // Check depth map resolution (model output size)
-            let depthWidth = CVPixelBufferGetWidth(depthMap)
-            let depthHeight = CVPixelBufferGetHeight(depthMap)
-            print("DEBUG: Depth map size: \(depthWidth)x\(depthHeight) (model output), RGB size: \(rgbWidth)x\(rgbHeight)")
+            // Align depth maps (LiDAR + Depth Anything)
+            self.alignDepthMaps(lidarDepth: lidarDepth, relativeDepth: relativeDepth)
             
-            // Save depth data: original size and upsampled to RGB resolution
-            DispatchQueue.global(qos: .utility).async {
-                self.saveDepthData(depthMap: depthMap, frameNumber: currentFrameNumber, directory: baseDir, targetWidth: rgbWidth, targetHeight: rgbHeight, rgbPixelBuffer: rgbBuffer)
+            // Detect lines and update UI
+            if let rgbImage = self.pixelBufferToUIImage(rgbBuffer) {
+                self.detectAndDisplayLines(image: rgbImage)
             }
         }
     }
     
-    private func saveRGBImage(pixelBuffer: CVPixelBuffer, frameNumber: Int, directory: URL) {
-        let rgbWidth = CVPixelBufferGetWidth(pixelBuffer)
-        let rgbHeight = CVPixelBufferGetHeight(pixelBuffer)
+    // MARK: - Depth Alignment (Scale-Shift)
+    
+    private func alignDepthMaps(lidarDepth: CVPixelBuffer?, relativeDepth: CVPixelBuffer) {
+        let relWidth = CVPixelBufferGetWidth(relativeDepth)
+        let relHeight = CVPixelBufferGetHeight(relativeDepth)
         
-        let ciImage = CIImage(cvPixelBuffer: pixelBuffer)
-        let context = CIContext()
+        depthWidth = relWidth
+        depthHeight = relHeight
         
-        guard let cgImage = context.createCGImage(ciImage, from: ciImage.extent) else {
-            print("DEBUG: Failed to create CGImage from pixel buffer")
-            return
+        // Extract relative depth values
+        CVPixelBufferLockBaseAddress(relativeDepth, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(relativeDepth, .readOnly) }
+        
+        guard let relBase = CVPixelBufferGetBaseAddress(relativeDepth) else { return }
+        let relBytesPerRow = CVPixelBufferGetBytesPerRow(relativeDepth)
+        let relBuffer = relBase.assumingMemoryBound(to: Float32.self)
+        
+        var relativeValues: [Float] = []
+        for y in 0..<relHeight {
+            let rowStart = relBuffer.advanced(by: y * (relBytesPerRow / MemoryLayout<Float32>.size))
+            for x in 0..<relWidth {
+                relativeValues.append(rowStart[x])
+            }
         }
         
-        let uiImage = UIImage(cgImage: cgImage)
-        let imagePath = directory.appendingPathComponent("rgb_frame_\(String(format: "%06d", frameNumber)).png")
+        // If LiDAR available, compute scale and shift
+        var scale: Float = 1.0
+        var shift: Float = 0.0
         
-        guard let imageData = uiImage.pngData() else {
-            print("DEBUG: Failed to convert UIImage to PNG data")
-            return
+        if let lidar = lidarDepth {
+            let (s, sh) = computeScaleShift(lidarDepth: lidar, relativeDepth: relativeValues, relWidth: relWidth, relHeight: relHeight)
+            scale = s
+            shift = sh
+            print("DEBUG: Depth alignment - scale: \(scale), shift: \(shift)")
+        } else {
+            // No LiDAR: use heuristic (assume depth range 0.5m - 5m)
+            let minRel = relativeValues.min() ?? 0
+            let maxRel = relativeValues.max() ?? 1
+            let range = maxRel - minRel
+            if range > 0 {
+                scale = 4.5 / range  // Map to 0.5m - 5m range
+                shift = 0.5 - minRel * scale
+            }
+            print("DEBUG: No LiDAR - using heuristic depth scaling")
         }
         
-        do {
-            try imageData.write(to: imagePath)
-            print("DEBUG: Saved RGB image: \(imagePath.lastPathComponent) (size: \(rgbWidth)x\(rgbHeight))")
-        } catch {
-            print("DEBUG: Failed to save RGB image: \(error)")
+        // Apply scale and shift to get absolute depth
+        absoluteDepthMap = relativeValues.map { $0 * scale + shift }
+    }
+    
+    private func computeScaleShift(lidarDepth: CVPixelBuffer, relativeDepth: [Float], relWidth: Int, relHeight: Int) -> (Float, Float) {
+        CVPixelBufferLockBaseAddress(lidarDepth, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(lidarDepth, .readOnly) }
+        
+        let lidarWidth = CVPixelBufferGetWidth(lidarDepth)
+        let lidarHeight = CVPixelBufferGetHeight(lidarDepth)
+        
+        guard let lidarBase = CVPixelBufferGetBaseAddress(lidarDepth) else {
+            return (1.0, 0.0)
+        }
+        
+        let lidarBytesPerRow = CVPixelBufferGetBytesPerRow(lidarDepth)
+        let lidarBuffer = lidarBase.assumingMemoryBound(to: Float32.self)
+        
+        // Collect corresponding points for least squares
+        var sumX: Double = 0  // relative depth
+        var sumY: Double = 0  // lidar depth
+        var sumXX: Double = 0
+        var sumXY: Double = 0
+        var count: Int = 0
+        
+        // Sample points from LiDAR depth map
+        let sampleStep = 4  // Sample every 4th pixel for speed
+        
+        for ly in stride(from: 0, to: lidarHeight, by: sampleStep) {
+            for lx in stride(from: 0, to: lidarWidth, by: sampleStep) {
+                let lidarIdx = ly * (lidarBytesPerRow / MemoryLayout<Float32>.size) + lx
+                let lidarValue = lidarBuffer[lidarIdx]
+                
+                // Skip invalid depth values
+                if lidarValue <= 0 || lidarValue > 10 || lidarValue.isNaN || lidarValue.isInfinite {
+                    continue
+                }
+                
+                // Map LiDAR coordinates to relative depth coordinates
+                let rx = Int(Float(lx) / Float(lidarWidth) * Float(relWidth))
+                let ry = Int(Float(ly) / Float(lidarHeight) * Float(relHeight))
+                
+                if rx >= 0 && rx < relWidth && ry >= 0 && ry < relHeight {
+                    let relIdx = ry * relWidth + rx
+                    let relValue = relativeDepth[relIdx]
+                    
+                    if !relValue.isNaN && !relValue.isInfinite {
+                        sumX += Double(relValue)
+                        sumY += Double(lidarValue)
+                        sumXX += Double(relValue) * Double(relValue)
+                        sumXY += Double(relValue) * Double(lidarValue)
+                        count += 1
+                    }
+                }
+            }
+        }
+        
+        // Least squares: y = scale * x + shift
+        if count > 10 {
+            let n = Double(count)
+            let denom = n * sumXX - sumX * sumX
+            if abs(denom) > 1e-6 {
+                let scale = Float((n * sumXY - sumX * sumY) / denom)
+                let shift = Float((sumY - scale * sumX) / n)
+                return (scale, shift)
+            }
+        }
+        
+        return (1.0, 0.0)
+    }
+    
+    // MARK: - Line Detection
+    
+    private func detectAndDisplayLines(image: UIImage) {
+        // Detect lines using LSD
+        let lines = OpenCVWrapper.detectLines(image)
+        
+        // Convert to Swift struct
+        var swiftLines: [DetectedLine] = []
+        for (index, line) in lines.enumerated() {
+            swiftLines.append(DetectedLine(
+                id: index,
+                x1: line.x1,
+                y1: line.y1,
+                x2: line.x2,
+                y2: line.y2
+            ))
+        }
+        
+        // Sort by length (longest first)
+        swiftLines.sort { $0.length2D > $1.length2D }
+        
+        // Keep top 20 lines
+        let topLines = Array(swiftLines.prefix(20))
+        
+        // Draw lines on image
+        let linesArray = NSMutableArray()
+        for line in topLines {
+            let segment = LineSegment()
+            segment.x1 = line.x1
+            segment.y1 = line.y1
+            segment.x2 = line.x2
+            segment.y2 = line.y2
+            linesArray.add(segment)
+        }
+        
+        let drawnImage = OpenCVWrapper.drawLines(image, lines: linesArray as! [LineSegment], selectedIndex: selectedLineIndex)
+        
+        DispatchQueue.main.async {
+            self.detectedLines = topLines
+            self.displayImage = drawnImage
         }
     }
     
-    private func depthToColor(_ normalizedDepth: Float) -> (UInt8, UInt8, UInt8) {
-        // Convert normalized depth (0.0 to 1.0) to RGB color using rainbow colormap
-        // Red (near) -> Yellow -> Green -> Cyan -> Blue (far)
-        let value = max(0.0, min(1.0, normalizedDepth))
+    // MARK: - Line Selection and Measurement
+    
+    func selectLine(at index: Int) {
+        guard index >= 0 && index < detectedLines.count else { return }
         
-        let r: UInt8
-        let g: UInt8
-        let b: UInt8
+        selectedLineIndex = index
+        let line = detectedLines[index]
         
-        if value < 0.25 {
-            // Red to Yellow
-            let t = value / 0.25
-            r = 255
-            g = UInt8(t * 255)
-            b = 0
-        } else if value < 0.5 {
-            // Yellow to Green
-            let t = (value - 0.25) / 0.25
-            r = UInt8((1.0 - t) * 255)
-            g = 255
-            b = 0
-        } else if value < 0.75 {
-            // Green to Cyan
-            let t = (value - 0.5) / 0.25
-            r = 0
-            g = 255
-            b = UInt8(t * 255)
-        } else {
-            // Cyan to Blue
-            let t = (value - 0.75) / 0.25
-            r = 0
-            g = UInt8((1.0 - t) * 255)
-            b = 255
+        // Calculate 3D length
+        let length = calculate3DLength(line: line)
+        
+        DispatchQueue.main.async {
+            self.measuredLength = length
+            
+            // Redraw with selection
+            if let image = self.displayImage {
+                let linesArray = NSMutableArray()
+                for l in self.detectedLines {
+                    let segment = LineSegment()
+                    segment.x1 = l.x1
+                    segment.y1 = l.y1
+                    segment.x2 = l.x2
+                    segment.y2 = l.y2
+                    linesArray.add(segment)
+                }
+                self.displayImage = OpenCVWrapper.drawLines(image, lines: linesArray as! [LineSegment], selectedIndex: index)
+            }
         }
         
-        return (r, g, b)
+        print("DEBUG: Selected line \(index), 3D length: \(length) meters")
     }
+    
+    func selectLineNear(point: CGPoint, imageSize: CGSize) {
+        // Find the closest line to the tap point
+        var minDistance: Float = Float.greatestFiniteMagnitude
+        var closestIndex = -1
+        
+        // Scale point to depth map coordinates
+        let scaleX = Float(depthWidth) / Float(imageSize.width)
+        let scaleY = Float(depthHeight) / Float(imageSize.height)
+        let scaledPoint = CGPoint(x: CGFloat(Float(point.x) * scaleX), y: CGFloat(Float(point.y) * scaleY))
+        
+        for (index, line) in detectedLines.enumerated() {
+            let distance = pointToLineDistance(
+                point: scaledPoint,
+                x1: line.x1, y1: line.y1,
+                x2: line.x2, y2: line.y2
+            )
+            
+            if distance < minDistance {
+                minDistance = distance
+                closestIndex = index
+            }
+        }
+        
+        // Select if close enough (within 30 pixels)
+        if closestIndex >= 0 && minDistance < 30 {
+            selectLine(at: closestIndex)
+        }
+    }
+    
+    private func pointToLineDistance(point: CGPoint, x1: Float, y1: Float, x2: Float, y2: Float) -> Float {
+        let px = Float(point.x)
+        let py = Float(point.y)
+        
+        let dx = x2 - x1
+        let dy = y2 - y1
+        let lengthSq = dx * dx + dy * dy
+        
+        if lengthSq == 0 {
+            return sqrtf((px - x1) * (px - x1) + (py - y1) * (py - y1))
+        }
+        
+        var t = ((px - x1) * dx + (py - y1) * dy) / lengthSq
+        t = max(0, min(1, t))
+        
+        let projX = x1 + t * dx
+        let projY = y1 + t * dy
+        
+        return sqrtf((px - projX) * (px - projX) + (py - projY) * (py - projY))
+    }
+    
+    private func calculate3DLength(line: DetectedLine) -> Float {
+        guard let depthMap = absoluteDepthMap,
+              let intrinsics = cameraIntrinsics,
+              depthWidth > 0 && depthHeight > 0 else {
+            return 0
+        }
+        
+        // Scale line coordinates to depth map resolution
+        let scaleX = Float(depthWidth) / Float(imageResolution.width)
+        let scaleY = Float(depthHeight) / Float(imageResolution.height)
+        
+        let dx1 = Int(line.x1 * scaleX)
+        let dy1 = Int(line.y1 * scaleY)
+        let dx2 = Int(line.x2 * scaleX)
+        let dy2 = Int(line.y2 * scaleY)
+        
+        // Clamp to valid range
+        let clampedX1 = max(0, min(depthWidth - 1, dx1))
+        let clampedY1 = max(0, min(depthHeight - 1, dy1))
+        let clampedX2 = max(0, min(depthWidth - 1, dx2))
+        let clampedY2 = max(0, min(depthHeight - 1, dy2))
+        
+        // Get depth values at endpoints
+        let depth1 = depthMap[clampedY1 * depthWidth + clampedX1]
+        let depth2 = depthMap[clampedY2 * depthWidth + clampedX2]
+        
+        // Scale intrinsics to depth map resolution
+        let fx = intrinsics[0][0] * scaleX
+        let fy = intrinsics[1][1] * scaleY
+        let cx = intrinsics[2][0] * scaleX
+        let cy = intrinsics[2][1] * scaleY
+        
+        // Unproject to 3D
+        let x1_3d = (Float(clampedX1) - cx) * depth1 / fx
+        let y1_3d = (Float(clampedY1) - cy) * depth1 / fy
+        let z1_3d = depth1
+        
+        let x2_3d = (Float(clampedX2) - cx) * depth2 / fx
+        let y2_3d = (Float(clampedY2) - cy) * depth2 / fy
+        let z2_3d = depth2
+        
+        // Calculate 3D Euclidean distance
+        let dx = x2_3d - x1_3d
+        let dy = y2_3d - y1_3d
+        let dz = z2_3d - z1_3d
+        
+        let length = sqrtf(dx * dx + dy * dy + dz * dz)
+        
+        print("DEBUG: 3D points - P1(\(x1_3d), \(y1_3d), \(z1_3d)) P2(\(x2_3d), \(y2_3d), \(z2_3d))")
+        print("DEBUG: Depths - D1: \(depth1)m, D2: \(depth2)m")
+        
+        return length
+    }
+    
+    // MARK: - Helper Functions
     
     private func convertYUVToRGB(_ yuvBuffer: CVPixelBuffer) -> CVPixelBuffer? {
         let width = CVPixelBufferGetWidth(yuvBuffer)
         let height = CVPixelBufferGetHeight(yuvBuffer)
         let pixelFormat = CVPixelBufferGetPixelFormatType(yuvBuffer)
         
-        // If already RGB, return as is
         if pixelFormat == kCVPixelFormatType_32BGRA || pixelFormat == kCVPixelFormatType_32ARGB {
             return yuvBuffer
         }
         
-        // Create RGB output buffer
         var rgbBuffer: CVPixelBuffer?
         let status = CVPixelBufferCreate(
             kCFAllocatorDefault,
@@ -193,11 +409,9 @@ class ARDataManager: ObservableObject {
         )
         
         guard status == kCVReturnSuccess, let outputBuffer = rgbBuffer else {
-            print("DEBUG: Failed to create RGB pixel buffer")
             return nil
         }
         
-        // Use Core Image to convert YUV to RGB
         let ciImage = CIImage(cvPixelBuffer: yuvBuffer)
         let context = CIContext()
         context.render(ciImage, to: outputBuffer)
@@ -205,275 +419,6 @@ class ARDataManager: ObservableObject {
         return outputBuffer
     }
     
-    private func upsampleDepthMap(_ depthMap: CVPixelBuffer, toWidth width: Int, height: Int) -> CVPixelBuffer? {
-        let sourceWidth = CVPixelBufferGetWidth(depthMap)
-        let sourceHeight = CVPixelBufferGetHeight(depthMap)
-        
-        // If already the same size, return original
-        if sourceWidth == width && sourceHeight == height {
-            return depthMap
-        }
-        
-        // Create output pixel buffer
-        var outputPixelBuffer: CVPixelBuffer?
-        let status = CVPixelBufferCreate(
-            kCFAllocatorDefault,
-            width,
-            height,
-            kCVPixelFormatType_DepthFloat32,
-            nil,
-            &outputPixelBuffer
-        )
-        
-        guard status == kCVReturnSuccess, let outputBuffer = outputPixelBuffer else {
-            print("DEBUG: Failed to create output pixel buffer for upsampling")
-            return nil
-        }
-        
-        // Use vImage for high-quality bilinear interpolation
-        CVPixelBufferLockBaseAddress(depthMap, .readOnly)
-        CVPixelBufferLockBaseAddress(outputBuffer, [])
-        defer {
-            CVPixelBufferUnlockBaseAddress(depthMap, .readOnly)
-            CVPixelBufferUnlockBaseAddress(outputBuffer, [])
-        }
-        
-        guard let sourceBase = CVPixelBufferGetBaseAddress(depthMap),
-              let destBase = CVPixelBufferGetBaseAddress(outputBuffer) else {
-            return nil
-        }
-        
-        let sourceBytesPerRow = CVPixelBufferGetBytesPerRow(depthMap)
-        let destBytesPerRow = CVPixelBufferGetBytesPerRow(outputBuffer)
-        
-        var sourceBuffer = vImage_Buffer(
-            data: sourceBase,
-            height: vImagePixelCount(sourceHeight),
-            width: vImagePixelCount(sourceWidth),
-            rowBytes: sourceBytesPerRow
-        )
-        
-        var destBuffer = vImage_Buffer(
-            data: destBase,
-            height: vImagePixelCount(height),
-            width: vImagePixelCount(width),
-            rowBytes: destBytesPerRow
-        )
-        
-        // Use high-quality scaling for depth values
-        let error = vImageScale_PlanarF(&sourceBuffer, &destBuffer, nil, vImage_Flags(kvImageHighQualityResampling))
-        
-        if error != kvImageNoError {
-            print("DEBUG: vImage depth scaling failed with error: \(error)")
-            return nil
-        }
-        
-        print("DEBUG: Upsampled depth map from \(sourceWidth)x\(sourceHeight) to \(width)x\(height)")
-        return outputBuffer
-    }
-    
-    private func saveDepthData(depthMap: CVPixelBuffer, frameNumber: Int, directory: URL, targetWidth: Int, targetHeight: Int, rgbPixelBuffer: CVPixelBuffer) {
-        CVPixelBufferLockBaseAddress(depthMap, .readOnly)
-        defer { CVPixelBufferUnlockBaseAddress(depthMap, .readOnly) }
-        
-        let width = CVPixelBufferGetWidth(depthMap)
-        let height = CVPixelBufferGetHeight(depthMap)
-        let bytesPerRow = CVPixelBufferGetBytesPerRow(depthMap)
-        let baseAddress = CVPixelBufferGetBaseAddress(depthMap)
-        
-        guard let baseAddr = baseAddress else {
-            print("DEBUG: Failed to get base address of depth map")
-            return
-        }
-        
-        // Read depth values as Float32
-        let buffer = baseAddr.assumingMemoryBound(to: Float32.self)
-        var depthValues: [Float] = []
-        
-        for y in 0..<height {
-            let rowStart = buffer.advanced(by: y * (bytesPerRow / MemoryLayout<Float32>.size))
-            for x in 0..<width {
-                depthValues.append(rowStart[x])
-            }
-        }
-        
-        // Save depth map as grayscale PNG image (model output directly)
-        if !depthValues.isEmpty {
-            let minDepth = depthValues.min() ?? 0
-            let maxDepth = depthValues.max() ?? 1
-            let range = maxDepth - minDepth
-            
-            // Normalize depth values to 0-255 for grayscale visualization
-            var grayscalePixels: [UInt8] = []
-            grayscalePixels.reserveCapacity(depthValues.count)
-            
-            for depth in depthValues {
-                let normalized = range > 0 ? ((depth - minDepth) / range) : 0
-                grayscalePixels.append(UInt8(max(0, min(255, normalized * 255.0))))
-            }
-            
-            // Create grayscale image from normalized depth values
-            let colorSpace = CGColorSpaceCreateDeviceGray()
-            grayscalePixels.withUnsafeMutableBytes { bytes in
-                if let context = CGContext(data: bytes.baseAddress, width: width, height: height, bitsPerComponent: 8, bytesPerRow: width, space: colorSpace, bitmapInfo: CGImageAlphaInfo.none.rawValue),
-                   let cgImage = context.makeImage() {
-                    let uiImage = UIImage(cgImage: cgImage)
-                    if let imageData = uiImage.pngData() {
-                        let imagePath = directory.appendingPathComponent("depth_image_\(String(format: "%06d", frameNumber)).png")
-                        do {
-                            try imageData.write(to: imagePath)
-                            print("DEBUG: Saved depth grayscale image (original): \(imagePath.lastPathComponent) (size: \(width)x\(height))")
-                        } catch {
-                            print("DEBUG: Failed to save depth image: \(error)")
-                        }
-                    }
-                }
-            }
-            
-            // Upsample depth map to RGB resolution using Lanczos and save
-            if let upsampledDepth = upsampleDepthMapLanczos(depthMap, toWidth: targetWidth, height: targetHeight) {
-                saveUpsampledDepthData(depthMap: upsampledDepth, frameNumber: frameNumber, directory: directory, targetWidth: targetWidth, targetHeight: targetHeight, rgbPixelBuffer: rgbPixelBuffer)
-            }
-        }
-    }
-    
-    private func upsampleDepthMapLanczos(_ depthMap: CVPixelBuffer, toWidth width: Int, height: Int) -> CVPixelBuffer? {
-        let sourceWidth = CVPixelBufferGetWidth(depthMap)
-        let sourceHeight = CVPixelBufferGetHeight(depthMap)
-        
-        // If already the same size, return original
-        if sourceWidth == width && sourceHeight == height {
-            return depthMap
-        }
-        
-        // Create output pixel buffer
-        var outputPixelBuffer: CVPixelBuffer?
-        let status = CVPixelBufferCreate(
-            kCFAllocatorDefault,
-            width,
-            height,
-            kCVPixelFormatType_DepthFloat32,
-            nil,
-            &outputPixelBuffer
-        )
-        
-        guard status == kCVReturnSuccess, let outputBuffer = outputPixelBuffer else {
-            print("DEBUG: Failed to create output pixel buffer for Lanczos upsampling")
-            return nil
-        }
-        
-        // Use Core Image with high-quality interpolation (Lanczos)
-        let ciImage = CIImage(cvPixelBuffer: depthMap)
-        
-        // Create scale transform
-        let scaleX = CGFloat(width) / CGFloat(sourceWidth)
-        let scaleY = CGFloat(height) / CGFloat(sourceHeight)
-        let transform = CGAffineTransform(scaleX: scaleX, y: scaleY)
-        let scaledImage = ciImage.transformed(by: transform)
-        
-        // Render with high-quality interpolation (Core Image uses Lanczos by default for high-quality scaling)
-        let context = CIContext(options: [.highQualityDownsample: true, .useSoftwareRenderer: false])
-        context.render(scaledImage, to: outputBuffer)
-        
-        print("DEBUG: Upsampled depth map using Lanczos from \(sourceWidth)x\(sourceHeight) to \(width)x\(height)")
-        return outputBuffer
-    }
-    
-    private func saveUpsampledDepthData(depthMap: CVPixelBuffer, frameNumber: Int, directory: URL, targetWidth: Int, targetHeight: Int, rgbPixelBuffer: CVPixelBuffer) {
-        CVPixelBufferLockBaseAddress(depthMap, .readOnly)
-        defer { CVPixelBufferUnlockBaseAddress(depthMap, .readOnly) }
-        
-        let width = CVPixelBufferGetWidth(depthMap)
-        let height = CVPixelBufferGetHeight(depthMap)
-        let bytesPerRow = CVPixelBufferGetBytesPerRow(depthMap)
-        let baseAddress = CVPixelBufferGetBaseAddress(depthMap)
-        
-        guard let baseAddr = baseAddress else {
-            print("DEBUG: Failed to get base address of upsampled depth map")
-            return
-        }
-        
-        // Read depth values as Float32
-        let buffer = baseAddr.assumingMemoryBound(to: Float32.self)
-        var depthValues: [Float] = []
-        
-        for y in 0..<height {
-            let rowStart = buffer.advanced(by: y * (bytesPerRow / MemoryLayout<Float32>.size))
-            for x in 0..<width {
-                depthValues.append(rowStart[x])
-            }
-        }
-        
-        // Create composite image: RGB on left, depth map on right
-        if !depthValues.isEmpty {
-            // Convert depth map to grayscale UIImage
-            let minDepth = depthValues.min() ?? 0
-            let maxDepth = depthValues.max() ?? 1
-            let range = maxDepth - minDepth
-            
-            var grayscalePixels: [UInt8] = []
-            grayscalePixels.reserveCapacity(depthValues.count)
-            
-            for depth in depthValues {
-                let normalized = range > 0 ? ((depth - minDepth) / range) : 0
-                grayscalePixels.append(UInt8(max(0, min(255, normalized * 255.0))))
-            }
-            
-            let colorSpace = CGColorSpaceCreateDeviceGray()
-            guard let depthCGImage = grayscalePixels.withUnsafeMutableBytes({ bytes -> CGImage? in
-                guard let context = CGContext(data: bytes.baseAddress, width: width, height: height, bitsPerComponent: 8, bytesPerRow: width, space: colorSpace, bitmapInfo: CGImageAlphaInfo.none.rawValue) else {
-                    return nil
-                }
-                return context.makeImage()
-            }) else {
-                print("DEBUG: Failed to create depth CGImage")
-                return
-            }
-            
-            let depthUIImage = UIImage(cgImage: depthCGImage)
-            
-            // Convert RGB pixel buffer to UIImage
-            let rgbCIImage = CIImage(cvPixelBuffer: rgbPixelBuffer)
-            let context = CIContext()
-            guard let rgbCGImage = context.createCGImage(rgbCIImage, from: rgbCIImage.extent) else {
-                print("DEBUG: Failed to create RGB CGImage")
-                return
-            }
-            let rgbUIImage = UIImage(cgImage: rgbCGImage)
-            
-            // Create composite image (side by side: RGB left, depth right)
-            let compositeWidth = width * 2
-            let compositeHeight = height
-            let compositeSize = CGSize(width: compositeWidth, height: compositeHeight)
-            
-            UIGraphicsBeginImageContextWithOptions(compositeSize, false, 1.0)
-            defer { UIGraphicsEndImageContext() }
-            
-            // Draw RGB image on the left
-            rgbUIImage.draw(in: CGRect(x: 0, y: 0, width: width, height: height))
-            
-            // Draw depth map on the right
-            depthUIImage.draw(in: CGRect(x: width, y: 0, width: width, height: height))
-            
-            guard let compositeImage = UIGraphicsGetImageFromCurrentImageContext() else {
-                print("DEBUG: Failed to create composite image")
-                return
-            }
-            
-            // Save composite image
-            if let imageData = compositeImage.pngData() {
-                let imagePath = directory.appendingPathComponent("composite_\(String(format: "%06d", frameNumber)).png")
-                do {
-                    try imageData.write(to: imagePath)
-                    print("DEBUG: Saved composite image (RGB + Depth): \(imagePath.lastPathComponent) (size: \(compositeWidth)x\(compositeHeight))")
-                } catch {
-                    print("DEBUG: Failed to save composite image: \(error)")
-                }
-            }
-        }
-    }
-    
-    // Helper function to convert CVPixelBuffer to UIImage
     private func pixelBufferToUIImage(_ pixelBuffer: CVPixelBuffer) -> UIImage? {
         let ciImage = CIImage(cvPixelBuffer: pixelBuffer)
         let context = CIContext()
@@ -483,3 +428,4 @@ class ARDataManager: ObservableObject {
         return UIImage(cgImage: cgImage)
     }
 }
+

@@ -15,8 +15,16 @@ struct ARViewContainer: UIViewRepresentable {
     func makeUIView(context: Context) -> ARView {
         let arView = ARView(frame: .zero)
         
-        // Configure AR session for RGB capture only (no LiDAR needed)
+        // Configure AR session with LiDAR depth
         let config = ARWorldTrackingConfiguration()
+        
+        // Enable LiDAR depth if available
+        if ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth) {
+            config.frameSemantics.insert(.sceneDepth)
+            print("DEBUG: LiDAR depth enabled")
+        } else {
+            print("DEBUG: LiDAR not available on this device")
+        }
         
         arView.session.run(config)
         arView.session.delegate = context.coordinator
