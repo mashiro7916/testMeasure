@@ -10,10 +10,13 @@
 #ifdef __cplusplus
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdocumentation"
-// Only import required OpenCV modules to avoid stitching conflicts
-#import <opencv2/core.hpp>
-#import <opencv2/imgproc.hpp>
+#pragma clang diagnostic ignored "-Wunused-parameter"
+
+// OpenCV 4.12 for iOS
+// Make sure opencv2.framework is added to the project and Framework Search Paths is set
+#import <opencv2/opencv.hpp>
 #import <opencv2/imgcodecs/ios.h>
+
 #pragma clang diagnostic pop
 #endif
 
