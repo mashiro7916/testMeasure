@@ -176,7 +176,8 @@ struct ARViewContainer: UIViewRepresentable {
             print("DEBUG: Camera anchor position: \(newCameraAnchor.position), children: \(newCameraAnchor.children.count)")
             
             // Verify anchor is in scene
-            if arView.scene.anchors.contains(newCameraAnchor) {
+            let anchorsInScene = arView.scene.anchors
+            if anchorsInScene.contains(where: { $0 === newCameraAnchor }) {
                 print("DEBUG: Camera anchor is in scene")
             } else {
                 print("DEBUG: WARNING - Camera anchor is NOT in scene!")
