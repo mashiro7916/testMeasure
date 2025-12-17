@@ -12,10 +12,21 @@ struct ContentView: View {
     
     var body: some View {
         ZStack {
-            // AR Camera View (background)
-            ARViewContainer(arManager: arManager)
-                .edgesIgnoringSafeArea(.all)
+            // Display image with lines (full screen)
+            if let image = arManager.displayImage {
+                Image(uiImage: image)
+                    .resizable()
+                    .aspectRatio(contentMode: .fill)
+                    .frame(width: UIScreen.main.bounds.width, height: UIScreen.main.bounds.height)
+                    .clipped()
+                    .edgesIgnoringSafeArea(.all)
+            } else {
+                // Fallback to AR view if no image
+                ARViewContainer(arManager: arManager)
+                    .edgesIgnoringSafeArea(.all)
+            }
             
+            // Overlay info
             VStack {
                 // Top info bar
                 HStack {
@@ -32,21 +43,7 @@ struct ContentView: View {
                 
                 Spacer()
                 
-                // Display image with lines
-                if let image = arManager.displayImage {
-                    GeometryReader { geometry in
-                        Image(uiImage: image)
-                            .resizable()
-                            .aspectRatio(contentMode: .fit)
-                            .frame(maxWidth: geometry.size.width, maxHeight: geometry.size.height * 0.6)
-                            .border(Color.white, width: 2)
-                    }
-                    .frame(height: 400)
-                }
-                
-                Spacer()
-                
-                // Line list with distances
+                // Line list with distances (bottom overlay)
                 if !arManager.detectedLines.isEmpty {
                     ScrollView {
                         VStack(spacing: 8) {
@@ -74,6 +71,7 @@ struct ContentView: View {
                         .padding()
                     }
                     .frame(maxHeight: 200)
+                    .background(Color.black.opacity(0.3))
                 }
             }
         }
