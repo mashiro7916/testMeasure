@@ -152,9 +152,6 @@ struct ARViewContainer: UIViewRepresentable {
             
             print("DEBUG: Created \(entityCount) line entities and added to scene (total lines: \(lines.count))")
             print("DEBUG: Camera anchor position: \(newCameraAnchor.position), children: \(newCameraAnchor.children.count)")
-            
-            // Force scene update
-            arView.scene.update(deltaTime: 0.0)
         }
         
         private func createLineEntity(from start: simd_float3, to end: simd_float3, color: UIColor) -> Entity {
