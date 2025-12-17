@@ -39,6 +39,7 @@ class ARDataManager: ObservableObject {
     // Published properties for UI
     @Published var detectedLines: [DetectedLine] = []  // Only lines > 10cm
     @Published var imageResolution: CGSize = .zero
+    @Published var displayImage: UIImage?  // RGB image with lines drawn
     
     // LiDAR depth data
     private var lidarDepthMap: [Float]?
@@ -178,8 +179,26 @@ class ARDataManager: ObservableObject {
             print("DEBUG: First line 3D points: p1=\(topLines[0].point3D1), p2=\(topLines[0].point3D2), length=\(topLines[0].length3D)m")
         }
         
+        // Draw lines on the image
+        let linesArray = NSMutableArray()
+        for line in topLines {
+            let segment = LineSegment()
+            segment.x1 = line.x1
+            segment.y1 = line.y1
+            segment.x2 = line.x2
+            segment.y2 = line.y2
+            linesArray.add(segment)
+        }
+        
+        // Draw lines on image (no selection, so pass -1)
+        var drawnImage = OpenCVWrapper.drawLines(image, lines: linesArray as! [LineSegment], selectedIndex: -1)
+        
+        // Add text labels with distances on the image
+        drawnImage = addDistanceLabels(to: drawnImage, lines: topLines)
+        
         DispatchQueue.main.async {
             self.detectedLines = topLines
+            self.displayImage = drawnImage
         }
     }
     
@@ -334,6 +353,61 @@ class ARDataManager: ObservableObject {
         return Line3DResult(point1: point1, point2: point2, length: length)
     }
     
+    
+    // MARK: - Image Drawing
+    
+    private func addDistanceLabels(to image: UIImage, lines: [DetectedLine]) -> UIImage {
+        let size = image.size
+        let scale = image.scale
+        
+        UIGraphicsBeginImageContextWithOptions(size, false, scale)
+        guard let context = UIGraphicsGetCurrentContext() else {
+            return image
+        }
+        
+        // Draw the original image
+        image.draw(at: .zero)
+        
+        // Configure text attributes
+        let textAttributes: [NSAttributedString.Key: Any] = [
+            .font: UIFont.boldSystemFont(ofSize: 16),
+            .foregroundColor: UIColor.yellow,
+            .strokeColor: UIColor.black,
+            .strokeWidth: -2.0  // Negative for fill with stroke
+        ]
+        
+        // Draw distance labels for each line
+        for (index, line) in lines.enumerated() {
+            // Calculate midpoint of the line
+            let midX = (line.x1 + line.x2) / 2.0
+            let midY = (line.y1 + line.y2) / 2.0
+            
+            // Format distance text
+            let distanceText = String(format: "%.1f cm", line.length3D * 100)
+            
+            // Draw text at midpoint
+            let text = NSAttributedString(string: distanceText, attributes: textAttributes)
+            let textSize = text.size()
+            let textRect = CGRect(
+                x: CGFloat(midX) - textSize.width / 2,
+                y: CGFloat(midY) - textSize.height / 2,
+                width: textSize.width,
+                height: textSize.height
+            )
+            
+            // Draw background rectangle for better visibility
+            context.setFillColor(UIColor.black.withAlphaComponent(0.5).cgColor)
+            context.fillEllipse(in: textRect.insetBy(dx: -4, dy: -2))
+            
+            // Draw text
+            text.draw(in: textRect)
+        }
+        
+        let resultImage = UIGraphicsGetImageFromCurrentImageContext()
+        UIGraphicsEndImageContext()
+        
+        return resultImage ?? image
+    }
     
     // MARK: - Helper Functions
     

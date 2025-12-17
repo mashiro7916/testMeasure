@@ -115,22 +115,14 @@
         cv::cvtColor(colorMat, colorMat, cv::COLOR_RGBA2BGR);
     }
     
-    // Draw all lines
+    // Draw all lines in yellow
     for (NSInteger i = 0; i < lines.count; i++) {
         LineSegment *line = lines[i];
         cv::Point pt1((int)line.x1, (int)line.y1);
         cv::Point pt2((int)line.x2, (int)line.y2);
         
-        if (i == selectedIndex) {
-            // Selected line: thick green
-            cv::line(colorMat, pt1, pt2, cv::Scalar(0, 255, 0), 4);
-            // Draw endpoints
-            cv::circle(colorMat, pt1, 8, cv::Scalar(0, 0, 255), -1);
-            cv::circle(colorMat, pt2, 8, cv::Scalar(0, 0, 255), -1);
-        } else {
-            // Other lines: thin blue
-            cv::line(colorMat, pt1, pt2, cv::Scalar(255, 100, 100), 2);
-        }
+        // Draw yellow line (BGR format: 0, 255, 255 = yellow)
+        cv::line(colorMat, pt1, pt2, cv::Scalar(0, 255, 255), 3);
     }
     
     // Convert back to UIImage
