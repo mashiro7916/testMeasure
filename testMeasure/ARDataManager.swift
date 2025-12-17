@@ -79,7 +79,7 @@ class ARDataManager: ObservableObject {
         
         // OpenCV grayscale test - convert RGB to grayscale and display (not save)
         if let rgbImage = pixelBufferToUIImage(rgbBuffer) {
-            let grayImage = OpenCVWrapper.convertToGrayscale(rgbImage)
+            let grayImage = OpenCVWrapper.convert(toGrayscale: rgbImage)
             DispatchQueue.main.async { [weak self] in
                 self?.opencvGrayscaleImage = grayImage
                 print("DEBUG: OpenCV grayscale image updated, OpenCV version: \(OpenCVWrapper.openCVVersion())")

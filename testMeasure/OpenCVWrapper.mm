@@ -6,8 +6,16 @@
 //
 
 #import "OpenCVWrapper.h"
-#import <opencv2/opencv.hpp>
+
+#ifdef __cplusplus
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdocumentation"
+// Only import required OpenCV modules to avoid stitching conflicts
+#import <opencv2/core.hpp>
+#import <opencv2/imgproc.hpp>
 #import <opencv2/imgcodecs/ios.h>
+#pragma clang diagnostic pop
+#endif
 
 @implementation OpenCVWrapper
 
