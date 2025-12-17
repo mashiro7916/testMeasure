@@ -55,7 +55,7 @@ struct ARViewContainer: UIViewRepresentable {
         var arManager: ARDataManager
         var arView: ARView?
         private var cameraAnchor: AnchorEntity?
-        private var lastLineCount: Int = -1
+        var lastLineCount: Int = -1  // Changed to internal for access from updateUIView
         
         init(arManager: ARDataManager) {
             self.arManager = arManager
@@ -146,7 +146,6 @@ struct ARViewContainer: UIViewRepresentable {
             material.color = .init(tint: color, texture: nil)
             material.metallic = 0.0
             material.roughness = 0.3  // Lower roughness for brighter appearance
-            material.isMetallic = false
             
             // Create model entity
             let lineEntity = ModelEntity(mesh: lineMesh, materials: [material])
