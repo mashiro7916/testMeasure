@@ -105,13 +105,35 @@ struct ARViewContainer: UIViewRepresentable {
             arView.scene.addAnchor(newCameraAnchor)
             cameraAnchor = newCameraAnchor
             
+            // TEST: Add simple test lines at fixed positions to verify rendering
+            // Create 3 test lines in front of camera
+            let testLines: [(start: simd_float3, end: simd_float3)] = [
+                // Horizontal line (left to right)
+                (simd_float3(-0.2, 0, -0.5), simd_float3(0.2, 0, -0.5)),
+                // Vertical line (bottom to top)
+                (simd_float3(0, -0.2, -0.5), simd_float3(0, 0.2, -0.5)),
+                // Diagonal line
+                (simd_float3(-0.15, -0.15, -0.5), simd_float3(0.15, 0.15, -0.5))
+            ]
+            
+            for (index, testLine) in testLines.enumerated() {
+                let testLineEntity = createLineEntity(from: testLine.start, to: testLine.end, color: .yellow)
+                newCameraAnchor.addChild(testLineEntity)
+                print("DEBUG: Added test line \(index) from \(testLine.start) to \(testLine.end)")
+            }
+            
+            print("DEBUG: Added \(testLines.count) test yellow lines at fixed positions")
+            
             // Create 3D line entities for each detected line
-            // Points are already in camera coordinate system, so we can use them directly
+            // IMPORTANT: RealityKit uses different coordinate system than ARKit camera coordinates
+            // ARKit camera: X right, Y up, Z forward
+            // RealityKit camera anchor: X right, Y up, Z backward (negative Z is forward)
             var entityCount = 0
             for (index, line) in lines.enumerated() {
-                // Points are in camera coordinate system (X right, Y up, Z forward)
-                let point1 = line.point3D1
-                let point2 = line.point3D2
+                // Convert from ARKit camera coordinates to RealityKit coordinates
+                // In RealityKit, negative Z is forward, so we need to negate Z
+                let point1 = simd_float3(line.point3D1.x, line.point3D1.y, -line.point3D1.z)
+                let point2 = simd_float3(line.point3D2.x, line.point3D2.y, -line.point3D2.z)
                 
                 // Check if points are in valid range (Z should be positive and reasonable)
                 let z1 = point1.z
@@ -152,6 +174,18 @@ struct ARViewContainer: UIViewRepresentable {
             
             print("DEBUG: Created \(entityCount) line entities and added to scene (total lines: \(lines.count))")
             print("DEBUG: Camera anchor position: \(newCameraAnchor.position), children: \(newCameraAnchor.children.count)")
+            
+            // Verify anchor is in scene
+            if arView.scene.anchors.contains(newCameraAnchor) {
+                print("DEBUG: Camera anchor is in scene")
+            } else {
+                print("DEBUG: WARNING - Camera anchor is NOT in scene!")
+            }
+            
+            // Print first entity details for debugging
+            if let firstEntity = newCameraAnchor.children.first as? ModelEntity {
+                print("DEBUG: First entity details - position: \(firstEntity.position), hasModel: \(firstEntity.components[ModelComponent.self] != nil)")
+            }
         }
         
         private func createLineEntity(from start: simd_float3, to end: simd_float3, color: UIColor) -> Entity {
@@ -169,13 +203,13 @@ struct ARViewContainer: UIViewRepresentable {
             // Create a cylinder mesh for the line
             // Cylinder is created along Y-axis by default
             // Increase radius significantly for better visibility
-            let lineMesh = MeshResource.generateCylinder(height: length, radius: 0.01) // 1cm radius (much more visible)
+            let lineMesh = MeshResource.generateCylinder(height: length, radius: 0.02) // 2cm radius (very visible)
             
-            // Create material with yellow color (bright and visible)
+            // Create material with bright yellow color
             var material = SimpleMaterial()
-            material.color = .init(tint: color, texture: nil)
+            material.color = .init(tint: UIColor.systemYellow, texture: nil)  // Use systemYellow for brighter color
             material.metallic = 0.0
-            material.roughness = 0.1  // Very low roughness for very bright appearance
+            material.roughness = 0.0  // Zero roughness for maximum brightness
             
             // Create model entity
             let lineEntity = ModelEntity(mesh: lineMesh, materials: [material])
