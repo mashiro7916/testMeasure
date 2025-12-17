@@ -29,10 +29,15 @@ struct ARViewContainer: UIViewRepresentable {
         arView.session.run(config)
         arView.session.delegate = context.coordinator
         
+        // Store ARView reference in coordinator
+        context.coordinator.arView = arView
+        
         return arView
     }
     
     func updateUIView(_ uiView: ARView, context: Context) {
+        // Update 3D lines when detectedLines change
+        context.coordinator.updateLines(arManager.detectedLines, frame: arManager.currentFrame)
     }
     
     func makeCoordinator() -> Coordinator {
@@ -41,6 +46,8 @@ struct ARViewContainer: UIViewRepresentable {
     
     class Coordinator: NSObject, ARSessionDelegate {
         var arManager: ARDataManager
+        var arView: ARView?
+        private var cameraAnchor: AnchorEntity?
         
         init(arManager: ARDataManager) {
             self.arManager = arManager
@@ -50,6 +57,89 @@ struct ARViewContainer: UIViewRepresentable {
             // Capture RGB image and depth data continuously
             arManager.captureFrame(frame: frame)
         }
+        
+        func updateLines(_ lines: [DetectedLine], frame: ARFrame?) {
+            guard let arView = arView else { return }
+            
+            // Remove old anchor if exists
+            if let oldAnchor = cameraAnchor {
+                arView.scene.removeAnchor(oldAnchor)
+            }
+            
+            // Create new anchor for lines (attached to camera)
+            let newCameraAnchor = AnchorEntity(.camera)
+            arView.scene.addAnchor(newCameraAnchor)
+            cameraAnchor = newCameraAnchor
+            
+            // Create 3D line entities for each detected line
+            // Points are already in camera coordinate system, so we can use them directly
+            for line in lines {
+                // Points are in camera coordinate system (X right, Y up, Z forward)
+                let point1 = line.point3D1
+                let point2 = line.point3D2
+                
+                // Create line entity
+                let lineEntity = createLineEntity(from: point1, to: point2, color: .yellow)
+                newCameraAnchor.addChild(lineEntity)
+            }
+        }
+        
+        private func createLineEntity(from start: simd_float3, to end: simd_float3, color: UIColor) -> Entity {
+            // Calculate line direction and length
+            let direction = end - start
+            let length = simd_length(direction)
+            
+            guard length > 0.001 else {
+                return Entity()
+            }
+            
+            // Create a cylinder mesh for the line
+            // Cylinder is created along Y-axis by default
+            let lineMesh = MeshResource.generateCylinder(height: length, radius: 0.003) // 3mm radius
+            
+            // Create material with yellow color
+            var material = SimpleMaterial()
+            material.color = .init(tint: color, texture: nil)
+            material.metallic = 0.0
+            material.roughness = 0.5
+            
+            // Create model entity
+            let lineEntity = ModelEntity(mesh: lineMesh, materials: [material])
+            
+            // Position and orient the line
+            // Calculate midpoint
+            let midpoint = (start + end) / 2.0
+            
+            // Calculate rotation to align cylinder (default Y-axis) with line direction
+            let normalizedDirection = simd_normalize(direction)
+            let defaultAxis = simd_float3(0, 1, 0)  // Cylinder default axis (Y-up)
+            
+            // Calculate rotation quaternion using look-at method
+            let dot = simd_dot(defaultAxis, normalizedDirection)
+            
+            // Handle edge cases
+            if abs(dot - 1.0) < 0.001 {
+                // Already aligned, no rotation needed
+                lineEntity.position = midpoint
+                return lineEntity
+            } else if abs(dot + 1.0) < 0.001 {
+                // Opposite direction, rotate 180 degrees around X or Z
+                let rotation = simd_quatf(angle: Float.pi, axis: simd_float3(1, 0, 0))
+                lineEntity.position = midpoint
+                lineEntity.orientation = rotation
+                return lineEntity
+            }
+            
+            // General case: calculate rotation axis and angle
+            let rotationAxis = simd_cross(defaultAxis, normalizedDirection)
+            let rotationAngle = acosf(max(-1.0, min(1.0, dot)))
+            let rotation = simd_quatf(angle: rotationAngle, axis: simd_normalize(rotationAxis))
+            
+            // Set position and orientation
+            lineEntity.position = midpoint
+            lineEntity.orientation = rotation
+            
+            return lineEntity
+        }
     }
 }
-

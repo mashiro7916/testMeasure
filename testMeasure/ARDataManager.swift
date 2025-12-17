@@ -12,71 +12,66 @@ import AVFoundation
 import CoreVideo
 import Accelerate
 
+// Line segment data structure for Swift
+struct DetectedLine: Identifiable {
+    let id: Int
+    let x1: Float
+    let y1: Float
+    let x2: Float
+    let y2: Float
+    let length3D: Float  // 3D length in meters
+    let point3D1: simd_float3  // 3D position of endpoint 1 (in camera coordinate system)
+    let point3D2: simd_float3  // 3D position of endpoint 2 (in camera coordinate system)
+    
+    var length2D: Float {
+        return sqrtf((x2 - x1) * (x2 - x1) + (y2 - y1) * (y2 - y1))
+    }
+}
+
 class ARDataManager: ObservableObject {
     private var frameCount: Int = 0
-    private var savedFrameCount: Int = 0
-    private let depthModelManager = DepthModelManager()
-    private let fileManager = FileManager.default
-    private var baseDirectory: URL?
+    private let processInterval: Int = 10  // Process every 10 frames for smoother UI
     
-    // Performance optimization: save less frequently
-    private let saveInterval: Int = 30  // Save every 30 frames (approximately 1 second at 30fps)
-    private var lastSaveTime: TimeInterval = 0
-    private let minSaveInterval: TimeInterval = 1.0  // Minimum 1 second between saves
+    // Camera intrinsics for 3D projection
+    private var cameraIntrinsics: simd_float3x3?
+    @Published var currentFrame: ARFrame?  // Store current frame for coordinate transformation
     
-    // Status
-    @Published var savedCount: Int = 0
-    @Published var isProcessing: Bool = false
+    // Published properties for UI
+    @Published var detectedLines: [DetectedLine] = []  // Only lines > 10cm
+    @Published var imageResolution: CGSize = .zero
+    
+    // LiDAR depth data
+    private var lidarDepthMap: [Float]?
+    private var lidarWidth: Int = 0
+    private var lidarHeight: Int = 0
     
     init() {
-        setupDirectory()
         print("DEBUG: ARDataManager initialized")
     }
     
-    private func setupDirectory() {
-        let documentsPath = fileManager.urls(for: .documentDirectory, in: .userDomainMask)[0]
-        baseDirectory = documentsPath.appendingPathComponent("testMeasure")
-        
-        guard let baseDir = baseDirectory else { return }
-        
-        do {
-            try fileManager.createDirectory(at: baseDir, withIntermediateDirectories: true)
-            print("DEBUG: Created directory at \(baseDir.path)")
-        } catch {
-            print("DEBUG: Failed to create directory: \(error)")
-        }
-    }
-    
     func captureFrame(frame: ARFrame) {
-        guard let baseDir = baseDirectory else { return }
-        
         frameCount += 1
-        let currentTime = frame.timestamp
         
-        // Check if we should save this frame (based on frame count and time interval)
-        let shouldSave = (frameCount % saveInterval == 0) && (currentTime - lastSaveTime >= minSaveInterval)
-        
-        if !shouldSave {
+        // Only process every N frames
+        if frameCount % processInterval != 0 {
             return
         }
         
-        savedFrameCount += 1
-        lastSaveTime = currentTime
-        let currentFrameNumber = savedFrameCount
-        
-        // Get RGB image
+        // Store camera intrinsics and current frame
+        cameraIntrinsics = frame.camera.intrinsics
         let pixelBuffer = frame.capturedImage
-        let rgbWidth = CVPixelBufferGetWidth(pixelBuffer)
-        let rgbHeight = CVPixelBufferGetHeight(pixelBuffer)
-        print("DEBUG: Capturing frame \(currentFrameNumber), RGB size: \(rgbWidth)x\(rgbHeight)")
+        let resolution = CGSize(
+            width: CVPixelBufferGetWidth(pixelBuffer),
+            height: CVPixelBufferGetHeight(pixelBuffer)
+        )
+        
+        DispatchQueue.main.async {
+            self.imageResolution = resolution
+            self.currentFrame = frame
+        }
         
         // Get LiDAR depth if available
         let lidarDepth = frame.sceneDepth?.depthMap
-        if let lidar = lidarDepth {
-            let lidarWidth = CVPixelBufferGetWidth(lidar)
-            let lidarHeight = CVPixelBufferGetHeight(lidar)
-            print("DEBUG: LiDAR depth size: \(lidarWidth)x\(lidarHeight)")
-        }
         
         // Convert YUV to RGB
         guard let rgbBuffer = convertYUVToRGB(pixelBuffer) else {
@@ -84,151 +79,256 @@ class ARDataManager: ObservableObject {
             return
         }
         
-        // Save RGB image on background queue
-        DispatchQueue.global(qos: .utility).async { [weak self] in
-            self?.saveRGBImage(pixelBuffer: rgbBuffer, frameNumber: currentFrameNumber, directory: baseDir)
-        }
-        
-        // Save LiDAR depth on background queue
+        // Extract and store LiDAR depth
         if let lidar = lidarDepth {
-            DispatchQueue.global(qos: .utility).async { [weak self] in
-                self?.saveLidarDepth(lidarDepth: lidar, frameNumber: currentFrameNumber, directory: baseDir)
-            }
+            extractLidarDepth(lidarDepth: lidar)
         }
         
-        // Run Depth Anything model on background queue
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            self?.depthModelManager.estimateDepth(from: rgbBuffer) { [weak self] relativeDepthMap in
-                guard let self = self, let relativeDepth = relativeDepthMap else {
-                    return
-                }
-                
-                // Save Depth Anything depth on background queue
-                DispatchQueue.global(qos: .utility).async {
-                    self.saveDepthAnythingDepth(depthMap: relativeDepth, frameNumber: currentFrameNumber, directory: baseDir)
-                }
-            }
+        // Detect lines and calculate 3D distances
+        if let rgbImage = pixelBufferToUIImage(rgbBuffer) {
+            detectLinesAndCalculateDistance(image: rgbImage)
         }
     }
     
-    // MARK: - Save Functions
+    // MARK: - LiDAR Depth Extraction
     
-    private func saveRGBImage(pixelBuffer: CVPixelBuffer, frameNumber: Int, directory: URL) {
-        let ciImage = CIImage(cvPixelBuffer: pixelBuffer)
-        let context = CIContext()
-        
-        guard let cgImage = context.createCGImage(ciImage, from: ciImage.extent) else {
-            print("DEBUG: Failed to create CGImage from pixel buffer")
-            return
-        }
-        
-        let uiImage = UIImage(cgImage: cgImage)
-        let imagePath = directory.appendingPathComponent("rgb_frame_\(String(format: "%06d", frameNumber)).png")
-        
-        guard let imageData = uiImage.pngData() else {
-            print("DEBUG: Failed to convert UIImage to PNG data")
-            return
-        }
-        
-        do {
-            try imageData.write(to: imagePath)
-            let width = CVPixelBufferGetWidth(pixelBuffer)
-            let height = CVPixelBufferGetHeight(pixelBuffer)
-            print("DEBUG: Saved RGB image: \(imagePath.lastPathComponent) (size: \(width)x\(height))")
-            
-            DispatchQueue.main.async {
-                self.savedCount = self.savedFrameCount
-            }
-        } catch {
-            print("DEBUG: Failed to save RGB image: \(error)")
-        }
-    }
-    
-    private func saveLidarDepth(lidarDepth: CVPixelBuffer, frameNumber: Int, directory: URL) {
+    private func extractLidarDepth(lidarDepth: CVPixelBuffer) {
         CVPixelBufferLockBaseAddress(lidarDepth, .readOnly)
         defer { CVPixelBufferUnlockBaseAddress(lidarDepth, .readOnly) }
         
-        let width = CVPixelBufferGetWidth(lidarDepth)
-        let height = CVPixelBufferGetHeight(lidarDepth)
+        lidarWidth = CVPixelBufferGetWidth(lidarDepth)
+        lidarHeight = CVPixelBufferGetHeight(lidarDepth)
         let bytesPerRow = CVPixelBufferGetBytesPerRow(lidarDepth)
         
         guard let baseAddress = CVPixelBufferGetBaseAddress(lidarDepth) else {
-            print("DEBUG: Failed to get LiDAR base address")
             return
         }
         
         let buffer = baseAddress.assumingMemoryBound(to: Float32.self)
         let rowBytes = bytesPerRow / MemoryLayout<Float32>.size
         
-        // Extract depth values
         var depthValues: [Float] = []
-        depthValues.reserveCapacity(width * height)
+        depthValues.reserveCapacity(lidarWidth * lidarHeight)
         
-        for y in 0..<height {
+        for y in 0..<lidarHeight {
             let rowStart = buffer.advanced(by: y * rowBytes)
-            for x in 0..<width {
+            for x in 0..<lidarWidth {
                 depthValues.append(rowStart[x])
             }
         }
         
-        // Save to text file
-        let filePath = directory.appendingPathComponent("lidar_depth_\(String(format: "%06d", frameNumber)).txt")
+        lidarDepthMap = depthValues
+        print("DEBUG: Extracted LiDAR depth: \(lidarWidth)x\(lidarHeight)")
+    }
+    
+    // MARK: - Line Detection and Distance Calculation
+    
+    private func detectLinesAndCalculateDistance(image: UIImage) {
+        // Detect lines using LSD
+        let lines = OpenCVWrapper.detectLines(image)
         
-        var content = "\(width) \(height)\n"  // Header: width height
-        for value in depthValues {
-            content += String(format: "%.6f\n", value)
+        guard let lidarDepth = lidarDepthMap, let intrinsics = cameraIntrinsics,
+              lidarWidth > 0 && lidarHeight > 0 else {
+            print("DEBUG: No LiDAR depth available for distance calculation")
+            return
         }
         
-        do {
-            try content.write(to: filePath, atomically: true, encoding: .utf8)
-            print("DEBUG: Saved LiDAR depth: \(filePath.lastPathComponent) (size: \(width)x\(height), \(depthValues.count) values)")
-        } catch {
-            print("DEBUG: Failed to save LiDAR depth: \(error)")
+        // Capture image resolution on current thread to avoid race condition
+        let currentResolution = imageResolution
+        
+        guard currentResolution.width > 0 && currentResolution.height > 0 else {
+            print("DEBUG: Invalid image resolution")
+            return
+        }
+        
+        // Convert to Swift struct and calculate 3D distances
+        var swiftLines: [DetectedLine] = []
+        for (index, line) in lines.enumerated() {
+            let result = calculate3DCoordinates(
+                x1: line.x1, y1: line.y1,
+                x2: line.x2, y2: line.y2,
+                lidarDepth: lidarDepth,
+                intrinsics: intrinsics,
+                imageResolution: currentResolution
+            )
+            
+            // Only keep lines longer than 10cm (0.1 meters)
+            if result.length > 0.1 {
+                swiftLines.append(DetectedLine(
+                    id: index,
+                    x1: line.x1,
+                    y1: line.y1,
+                    x2: line.x2,
+                    y2: line.y2,
+                    length3D: result.length,
+                    point3D1: result.point1,
+                    point3D2: result.point2
+                ))
+            }
+        }
+        
+        // Sort by 3D length (longest first)
+        swiftLines.sort { $0.length3D > $1.length3D }
+        
+        // Keep only top 10 lines (all must be > 10cm)
+        let topLines = Array(swiftLines.prefix(10))
+        
+        DispatchQueue.main.async {
+            self.detectedLines = topLines
         }
     }
     
-    private func saveDepthAnythingDepth(depthMap: CVPixelBuffer, frameNumber: Int, directory: URL) {
-        CVPixelBufferLockBaseAddress(depthMap, .readOnly)
-        defer { CVPixelBufferUnlockBaseAddress(depthMap, .readOnly) }
+    // Structure to return 3D coordinates and length
+    private struct Line3DResult {
+        let point1: simd_float3
+        let point2: simd_float3
+        let length: Float
+    }
+    
+    // MARK: - Depth Sampling and Interpolation
+    
+    /// Bilinear interpolation to get depth value at sub-pixel coordinates
+    private func bilinearInterpolateDepth(x: Float, y: Float, lidarDepth: [Float]) -> Float? {
+        let x0 = Int(floor(x))
+        let y0 = Int(floor(y))
+        let x1 = x0 + 1
+        let y1 = y0 + 1
         
-        let width = CVPixelBufferGetWidth(depthMap)
-        let height = CVPixelBufferGetHeight(depthMap)
-        let bytesPerRow = CVPixelBufferGetBytesPerRow(depthMap)
+        // Clamp to valid range
+        let clampedX0 = max(0, min(lidarWidth - 1, x0))
+        let clampedY0 = max(0, min(lidarHeight - 1, y0))
+        let clampedX1 = max(0, min(lidarWidth - 1, x1))
+        let clampedY1 = max(0, min(lidarHeight - 1, y1))
         
-        guard let baseAddress = CVPixelBufferGetBaseAddress(depthMap) else {
-            print("DEBUG: Failed to get depth map base address")
-            return
+        // Get depth values at four corners
+        let idx00 = clampedY0 * lidarWidth + clampedX0
+        let idx01 = clampedY1 * lidarWidth + clampedX0
+        let idx10 = clampedY0 * lidarWidth + clampedX1
+        let idx11 = clampedY1 * lidarWidth + clampedX1
+        
+        guard idx00 < lidarDepth.count && idx01 < lidarDepth.count &&
+              idx10 < lidarDepth.count && idx11 < lidarDepth.count else {
+            return nil
         }
         
-        let buffer = baseAddress.assumingMemoryBound(to: Float32.self)
-        let rowBytes = bytesPerRow / MemoryLayout<Float32>.size
+        let d00 = lidarDepth[idx00]
+        let d01 = lidarDepth[idx01]
+        let d10 = lidarDepth[idx10]
+        let d11 = lidarDepth[idx11]
         
-        // Extract depth values
-        var depthValues: [Float] = []
-        depthValues.reserveCapacity(width * height)
+        // Check if any depth value is invalid
+        if d00 <= 0 || d01 <= 0 || d10 <= 0 || d11 <= 0 ||
+           d00.isNaN || d01.isNaN || d10.isNaN || d11.isNaN ||
+           d00.isInfinite || d01.isInfinite || d10.isInfinite || d11.isInfinite {
+            return nil
+        }
         
-        for y in 0..<height {
-            let rowStart = buffer.advanced(by: y * rowBytes)
-            for x in 0..<width {
-                depthValues.append(rowStart[x])
+        // Bilinear interpolation
+        let fx = x - Float(clampedX0)
+        let fy = y - Float(clampedY0)
+        
+        let d0 = d00 * (1 - fx) + d10 * fx
+        let d1 = d01 * (1 - fx) + d11 * fx
+        let depth = d0 * (1 - fy) + d1 * fy
+        
+        return depth
+    }
+    
+    /// Sample multiple points along the line and calculate average depth
+    private func sampleLineDepth(x1: Float, y1: Float, x2: Float, y2: Float,
+                                 lidarDepth: [Float], numSamples: Int = 5) -> (Float, Float)? {
+        // Sample endpoints first (most important)
+        guard let depth1_start = bilinearInterpolateDepth(x: x1, y: y1, lidarDepth: lidarDepth),
+              let depth2_end = bilinearInterpolateDepth(x: x2, y: y2, lidarDepth: lidarDepth) else {
+            return nil
+        }
+        
+        // Sample additional points along the line for validation
+        var validDepths: [Float] = [depth1_start]
+        validDepths.reserveCapacity(numSamples)
+        
+        // Sample intermediate points (skip first and last as they are endpoints)
+        for i in 1..<(numSamples - 1) {
+            let t = Float(i) / Float(max(1, numSamples - 1))
+            let x = x1 + (x2 - x1) * t
+            let y = y1 + (y2 - y1) * t
+            
+            if let depth = bilinearInterpolateDepth(x: x, y: y, lidarDepth: lidarDepth) {
+                validDepths.append(depth)
             }
         }
         
-        // Save to text file
-        let filePath = directory.appendingPathComponent("depthanything_depth_\(String(format: "%06d", frameNumber)).txt")
+        validDepths.append(depth2_end)
         
-        var content = "\(width) \(height)\n"  // Header: width height
-        for value in depthValues {
-            content += String(format: "%.6f\n", value)
-        }
-        
-        do {
-            try content.write(to: filePath, atomically: true, encoding: .utf8)
-            print("DEBUG: Saved Depth Anything depth: \(filePath.lastPathComponent) (size: \(width)x\(height), \(depthValues.count) values)")
-        } catch {
-            print("DEBUG: Failed to save Depth Anything depth: \(error)")
-        }
+        // Use endpoints directly (they are the most accurate for line endpoints)
+        // The intermediate samples are used for validation
+        return (depth1_start, depth2_end)
     }
+    
+    private func calculate3DCoordinates(x1: Float, y1: Float, x2: Float, y2: Float,
+                                       lidarDepth: [Float], intrinsics: simd_float3x3,
+                                       imageResolution: CGSize) -> Line3DResult {
+        // Scale line coordinates from image resolution to LiDAR resolution
+        let scaleX = Float(lidarWidth) / Float(imageResolution.width)
+        let scaleY = Float(lidarHeight) / Float(imageResolution.height)
+        
+        // Map line endpoints to LiDAR coordinates (keep as Float for interpolation)
+        let lx1 = x1 * scaleX
+        let ly1 = y1 * scaleY
+        let lx2 = x2 * scaleX
+        let ly2 = y2 * scaleY
+        
+        // Sample depth along the line using bilinear interpolation
+        guard let (depth1, depth2) = sampleLineDepth(
+            x1: lx1, y1: ly1, x2: lx2, y2: ly2,
+            lidarDepth: lidarDepth, numSamples: 5
+        ) else {
+            return Line3DResult(point1: simd_float3(0, 0, 0), point2: simd_float3(0, 0, 0), length: 0)
+        }
+        
+        // Clamp coordinates to valid range for projection
+        let clampedX1 = max(0.0, min(Float(lidarWidth - 1), lx1))
+        let clampedY1 = max(0.0, min(Float(lidarHeight - 1), ly1))
+        let clampedX2 = max(0.0, min(Float(lidarWidth - 1), lx2))
+        let clampedY2 = max(0.0, min(Float(lidarHeight - 1), ly2))
+        
+        // Scale intrinsics to LiDAR resolution
+        let fx = intrinsics[0][0] * scaleX
+        let fy = intrinsics[1][1] * scaleY
+        let cx = intrinsics[2][0] * scaleX
+        let cy = intrinsics[2][1] * scaleY
+        
+        // Validate intrinsics
+        guard fx > 0 && fy > 0 else {
+            return Line3DResult(point1: simd_float3(0, 0, 0), point2: simd_float3(0, 0, 0), length: 0)
+        }
+        
+        // Unproject 2D points to 3D using camera intrinsics
+        // Formula: X = (u - cx) * Z / fx, Y = (v - cy) * Z / fy, Z = depth
+        // Note: ARKit camera coordinate system: X right, Y up, Z forward (right-handed)
+        // Image coordinate system: X right, Y down, Z forward
+        // So we need to flip Y: Y_camera = -Y_image
+        let x1_3d = (clampedX1 - cx) * depth1 / fx
+        let y1_3d = -(clampedY1 - cy) * depth1 / fy  // Flip Y for camera coordinate
+        let z1_3d = depth1
+        
+        let x2_3d = (clampedX2 - cx) * depth2 / fx
+        let y2_3d = -(clampedY2 - cy) * depth2 / fy  // Flip Y for camera coordinate
+        let z2_3d = depth2
+        
+        let point1 = simd_float3(x1_3d, y1_3d, z1_3d)
+        let point2 = simd_float3(x2_3d, y2_3d, z2_3d)
+        
+        // Calculate 3D Euclidean distance
+        let dx = x2_3d - x1_3d
+        let dy = y2_3d - y1_3d
+        let dz = z2_3d - z1_3d
+        
+        let length = sqrtf(dx * dx + dy * dy + dz * dz)
+        
+        return Line3DResult(point1: point1, point2: point2, length: length)
+    }
+    
     
     // MARK: - Helper Functions
     
@@ -237,12 +337,10 @@ class ARDataManager: ObservableObject {
         let height = CVPixelBufferGetHeight(yuvBuffer)
         let pixelFormat = CVPixelBufferGetPixelFormatType(yuvBuffer)
         
-        // If already RGB, return as is
         if pixelFormat == kCVPixelFormatType_32BGRA || pixelFormat == kCVPixelFormatType_32ARGB {
             return yuvBuffer
         }
         
-        // Create RGB output buffer
         var rgbBuffer: CVPixelBuffer?
         let status = CVPixelBufferCreate(
             kCFAllocatorDefault,
@@ -257,11 +355,19 @@ class ARDataManager: ObservableObject {
             return nil
         }
         
-        // Use Core Image to convert YUV to RGB
         let ciImage = CIImage(cvPixelBuffer: yuvBuffer)
         let context = CIContext()
         context.render(ciImage, to: outputBuffer)
         
         return outputBuffer
+    }
+    
+    private func pixelBufferToUIImage(_ pixelBuffer: CVPixelBuffer) -> UIImage? {
+        let ciImage = CIImage(cvPixelBuffer: pixelBuffer)
+        let context = CIContext()
+        guard let cgImage = context.createCGImage(ciImage, from: ciImage.extent) else {
+            return nil
+        }
+        return UIImage(cgImage: cgImage)
     }
 }
