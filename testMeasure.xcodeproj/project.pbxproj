@@ -407,6 +407,16 @@
 				INFOPLIST_KEY_NSCameraUsageDescription = "This app needs camera access to capture RGB images and LiDAR depth data.";
 				INFOPLIST_KEY_UIFileSharingEnabled = YES;
 				INFOPLIST_KEY_LSSupportsOpeningDocumentsInPlace = YES;
+				FRAMEWORK_SEARCH_PATHS = (
+					"$(inherited)",
+					"$(PROJECT_DIR)",
+					"$(PROJECT_DIR)/**",
+				);
+				HEADER_SEARCH_PATHS = (
+					"$(inherited)",
+					"$(PROJECT_DIR)/opencv2.framework/Headers",
+					"$(PROJECT_DIR)/**",
+				);
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
@@ -415,6 +425,7 @@
 				PRODUCT_BUNDLE_IDENTIFIER = com.abist.testMeasure;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_OBJC_BRIDGING_HEADER = "testMeasure/testMeasure-Bridging-Header.h";
 				SWIFT_VERSION = 5.0;
 				TARGETED_DEVICE_FAMILY = "1,2";
 			};
@@ -439,6 +450,16 @@
 				INFOPLIST_KEY_NSCameraUsageDescription = "This app needs camera access to capture RGB images and LiDAR depth data.";
 				INFOPLIST_KEY_UIFileSharingEnabled = YES;
 				INFOPLIST_KEY_LSSupportsOpeningDocumentsInPlace = YES;
+				FRAMEWORK_SEARCH_PATHS = (
+					"$(inherited)",
+					"$(PROJECT_DIR)",
+					"$(PROJECT_DIR)/**",
+				);
+				HEADER_SEARCH_PATHS = (
+					"$(inherited)",
+					"$(PROJECT_DIR)/opencv2.framework/Headers",
+					"$(PROJECT_DIR)/**",
+				);
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
@@ -447,6 +468,7 @@
 				PRODUCT_BUNDLE_IDENTIFIER = com.abist.testMeasure;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_OBJC_BRIDGING_HEADER = "testMeasure/testMeasure-Bridging-Header.h";
 				SWIFT_VERSION = 5.0;
 				TARGETED_DEVICE_FAMILY = "1,2";
 			};

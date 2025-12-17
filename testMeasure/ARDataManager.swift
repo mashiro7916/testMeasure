@@ -25,6 +25,17 @@ struct DetectedLine: Identifiable {
     }
 }
 
+// Depth accuracy statistics
+struct DepthAccuracyStats {
+    let meanError: Float          // Mean absolute error (meters)
+    let rmse: Float               // Root mean square error (meters)
+    let maxError: Float           // Maximum error (meters)
+    let minError: Float           // Minimum error (meters)
+    let validPoints: Int          // Number of valid comparison points
+    let alignmentScale: Float     // Computed scale factor
+    let alignmentShift: Float     // Computed shift factor
+}
+
 class ARDataManager: ObservableObject {
     private var frameCount: Int = 0
     private let depthModelManager = DepthModelManager()
@@ -41,8 +52,15 @@ class ARDataManager: ObservableObject {
     @Published var measuredLength: Float = 0.0  // in meters
     @Published var isProcessing: Bool = false
     
+    // Depth visualization
+    @Published var alignedDepthImage: UIImage?      // Aligned depth map visualization
+    @Published var lidarDepthImage: UIImage?       // LiDAR depth map visualization
+    @Published var errorHeatMap: UIImage?          // Error heat map (aligned - LiDAR)
+    @Published var showDepthComparison: Bool = false
+    
     // Depth data
     private var absoluteDepthMap: [Float]?  // Aligned absolute depth (meters)
+    private var lidarDepthMapResampled: [Float]?  // LiDAR depth resampled to depth map resolution
     private var depthWidth: Int = 0
     private var depthHeight: Int = 0
     
@@ -83,6 +101,9 @@ class ARDataManager: ObservableObject {
             
             // Align depth maps (LiDAR + Depth Anything)
             self.alignDepthMaps(lidarDepth: lidarDepth, relativeDepth: relativeDepth)
+            
+            // Generate depth visualizations
+            self.generateDepthVisualizations()
             
             // Detect lines and update UI
             if let rgbImage = self.pixelBufferToUIImage(rgbBuffer) {
@@ -139,6 +160,278 @@ class ARDataManager: ObservableObject {
         
         // Apply scale and shift to get absolute depth
         absoluteDepthMap = relativeValues.map { $0 * scale + shift }
+        
+        // Resample LiDAR depth to depth map resolution for comparison
+        if let lidar = lidarDepth {
+            lidarDepthMapResampled = resampleLidarDepth(lidarDepth: lidar, targetWidth: relWidth, targetHeight: relHeight)
+        } else {
+            lidarDepthMapResampled = nil
+        }
+    }
+    
+    // MARK: - Depth Visualization
+    
+    private func generateDepthVisualizations() {
+        guard let alignedDepth = absoluteDepthMap, depthWidth > 0 && depthHeight > 0 else {
+            return
+        }
+        
+        // Generate aligned depth visualization
+        alignedDepthImage = createDepthVisualization(depthMap: alignedDepth, width: depthWidth, height: depthHeight, title: "Aligned Depth")
+        
+        // Generate LiDAR depth visualization if available
+        if let lidarDepth = lidarDepthMapResampled {
+            lidarDepthImage = createDepthVisualization(depthMap: lidarDepth, width: depthWidth, height: depthHeight, title: "LiDAR Depth")
+            
+            // Generate error heat map
+            errorHeatMap = createErrorHeatMap(alignedDepth: alignedDepth, lidarDepth: lidarDepth, width: depthWidth, height: depthHeight)
+        } else {
+            lidarDepthImage = nil
+            errorHeatMap = nil
+        }
+    }
+    
+    private func resampleLidarDepth(lidarDepth: CVPixelBuffer, targetWidth: Int, targetHeight: Int) -> [Float] {
+        CVPixelBufferLockBaseAddress(lidarDepth, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(lidarDepth, .readOnly) }
+        
+        let lidarWidth = CVPixelBufferGetWidth(lidarDepth)
+        let lidarHeight = CVPixelBufferGetHeight(lidarDepth)
+        
+        guard let lidarBase = CVPixelBufferGetBaseAddress(lidarDepth) else {
+            return []
+        }
+        
+        let lidarBytesPerRow = CVPixelBufferGetBytesPerRow(lidarDepth)
+        let lidarBuffer = lidarBase.assumingMemoryBound(to: Float32.self)
+        let lidarRowBytes = lidarBytesPerRow / MemoryLayout<Float32>.size
+        
+        var resampled: [Float] = []
+        resampled.reserveCapacity(targetWidth * targetHeight)
+        
+        for ty in 0..<targetHeight {
+            for tx in 0..<targetWidth {
+                // Map target coordinates to LiDAR coordinates
+                let lx = Int(Float(tx) / Float(targetWidth) * Float(lidarWidth))
+                let ly = Int(Float(ty) / Float(targetHeight) * Float(lidarHeight))
+                
+                let lidarIdx = min(ly, lidarHeight - 1) * lidarRowBytes + min(lx, lidarWidth - 1)
+                let lidarValue = lidarBuffer[lidarIdx]
+                
+                // Use valid LiDAR value, or 0 if invalid
+                if lidarValue > 0 && lidarValue <= 10 && !lidarValue.isNaN && !lidarValue.isInfinite {
+                    resampled.append(lidarValue)
+                } else {
+                    resampled.append(0)  // Invalid depth
+                }
+            }
+        }
+        
+        return resampled
+    }
+    
+    private func createDepthVisualization(depthMap: [Float], width: Int, height: Int, title: String) -> UIImage? {
+        guard depthMap.count == width * height else { return nil }
+        
+        // Find valid depth range
+        let validDepths = depthMap.filter { $0 > 0 && $0 <= 10 }
+        guard let minDepth = validDepths.min(), let maxDepth = validDepths.max(), maxDepth > minDepth else {
+            return nil
+        }
+        
+        // Create color image from depth map
+        let colorSpace = CGColorSpaceCreateDeviceRGB()
+        let bytesPerPixel = 4
+        let bytesPerRow = width * bytesPerPixel
+        var pixels = [UInt8](repeating: 0, count: width * height * bytesPerPixel)
+        
+        for (index, depth) in depthMap.enumerated() {
+            let offset = index * bytesPerPixel
+            
+            if depth > 0 && depth <= 10 {
+                // Normalize depth to 0-1 range
+                let normalized = (depth - minDepth) / (maxDepth - minDepth)
+                
+                // Use colormap: blue (near) -> green -> yellow -> red (far)
+                let (r, g, b) = depthToColor(normalized)
+                pixels[offset] = b
+                pixels[offset + 1] = g
+                pixels[offset + 2] = r
+                pixels[offset + 3] = 255  // Alpha
+            } else {
+                // Invalid depth: black
+                pixels[offset] = 0
+                pixels[offset + 1] = 0
+                pixels[offset + 2] = 0
+                pixels[offset + 3] = 255
+            }
+        }
+        
+        guard let context = CGContext(
+            data: &pixels,
+            width: width,
+            height: height,
+            bitsPerComponent: 8,
+            bytesPerRow: bytesPerRow,
+            space: colorSpace,
+            bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue
+        ), let cgImage = context.makeImage() else {
+            return nil
+        }
+        
+        let image = UIImage(cgImage: cgImage)
+        
+        // Add title text to image
+        return addTextToImage(image: image, text: title)
+    }
+    
+    private func createErrorHeatMap(alignedDepth: [Float], lidarDepth: [Float], width: Int, height: Int) -> UIImage? {
+        guard alignedDepth.count == lidarDepth.count && alignedDepth.count == width * height else {
+            return nil
+        }
+        
+        // Calculate errors
+        var errors: [Float] = []
+        errors.reserveCapacity(alignedDepth.count)
+        
+        for i in 0..<alignedDepth.count {
+            let aligned = alignedDepth[i]
+            let lidar = lidarDepth[i]
+            
+            // Only calculate error for valid depths
+            if aligned > 0 && aligned <= 10 && lidar > 0 && lidar <= 10 {
+                errors.append(abs(aligned - lidar))
+            } else {
+                errors.append(-1)  // Invalid
+            }
+        }
+        
+        // Find error range
+        let validErrors = errors.filter { $0 >= 0 }
+        guard let minError = validErrors.min(), let maxError = validErrors.max(), maxError > minError else {
+            return nil
+        }
+        
+        // Create heat map: green (low error) -> yellow -> red (high error)
+        let colorSpace = CGColorSpaceCreateDeviceRGB()
+        let bytesPerPixel = 4
+        let bytesPerRow = width * bytesPerPixel
+        var pixels = [UInt8](repeating: 0, count: width * height * bytesPerPixel)
+        
+        for (index, error) in errors.enumerated() {
+            let offset = index * bytesPerPixel
+            
+            if error >= 0 {
+                // Normalize error to 0-1 range
+                let normalized = (error - minError) / (maxError - minError)
+                
+                // Heat map colormap: green -> yellow -> red
+                let (r, g, b) = errorToColor(normalized)
+                pixels[offset] = b
+                pixels[offset + 1] = g
+                pixels[offset + 2] = r
+                pixels[offset + 3] = 255
+            } else {
+                // Invalid: black
+                pixels[offset] = 0
+                pixels[offset + 1] = 0
+                pixels[offset + 2] = 0
+                pixels[offset + 3] = 255
+            }
+        }
+        
+        guard let context = CGContext(
+            data: &pixels,
+            width: width,
+            height: height,
+            bitsPerComponent: 8,
+            bytesPerRow: bytesPerRow,
+            space: colorSpace,
+            bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue
+        ), let cgImage = context.makeImage() else {
+            return nil
+        }
+        
+        let image = UIImage(cgImage: cgImage)
+        
+        // Add title and error range
+        let errorText = String(format: "Error: %.3f - %.3f m", minError, maxError)
+        return addTextToImage(image: image, text: "Error Heat Map\n\(errorText)")
+    }
+    
+    private func depthToColor(_ normalizedDepth: Float) -> (UInt8, UInt8, UInt8) {
+        // Colormap: blue (near) -> cyan -> green -> yellow -> red (far)
+        let value = max(0.0, min(1.0, normalizedDepth))
+        
+        if value < 0.25 {
+            // Blue to Cyan
+            let t = value / 0.25
+            return (0, UInt8(t * 255), 255)
+        } else if value < 0.5 {
+            // Cyan to Green
+            let t = (value - 0.25) / 0.25
+            return (0, 255, UInt8((1.0 - t) * 255))
+        } else if value < 0.75 {
+            // Green to Yellow
+            let t = (value - 0.5) / 0.25
+            return (UInt8(t * 255), 255, 0)
+        } else {
+            // Yellow to Red
+            let t = (value - 0.75) / 0.25
+            return (255, UInt8((1.0 - t) * 255), 0)
+        }
+    }
+    
+    private func errorToColor(_ normalizedError: Float) -> (UInt8, UInt8, UInt8) {
+        // Heat map: green (low error) -> yellow -> red (high error)
+        let value = max(0.0, min(1.0, normalizedError))
+        
+        if value < 0.5 {
+            // Green to Yellow
+            let t = value / 0.5
+            return (UInt8(t * 255), 255, 0)
+        } else {
+            // Yellow to Red
+            let t = (value - 0.5) / 0.5
+            return (255, UInt8((1.0 - t) * 255), 0)
+        }
+    }
+    
+    private func addTextToImage(image: UIImage, text: String) -> UIImage? {
+        let size = image.size
+        let scale = image.scale
+        
+        UIGraphicsBeginImageContextWithOptions(size, false, scale)
+        defer { UIGraphicsEndImageContext() }
+        
+        guard let context = UIGraphicsGetCurrentContext() else { return image }
+        
+        // Draw original image
+        image.draw(in: CGRect(origin: .zero, size: size))
+        
+        // Draw text
+        let paragraphStyle = NSMutableParagraphStyle()
+        paragraphStyle.alignment = .center
+        
+        let attributes: [NSAttributedString.Key: Any] = [
+            .font: UIFont.boldSystemFont(ofSize: 16),
+            .foregroundColor: UIColor.white,
+            .paragraphStyle: paragraphStyle,
+            .strokeColor: UIColor.black,
+            .strokeWidth: -2.0
+        ]
+        
+        let textSize = text.size(withAttributes: attributes)
+        let textRect = CGRect(
+            x: (size.width - textSize.width) / 2,
+            y: 10,
+            width: textSize.width,
+            height: textSize.height
+        )
+        
+        text.draw(in: textRect, withAttributes: attributes)
+        
+        return UIGraphicsGetImageFromCurrentImageContext() ?? image
     }
     
     private func computeScaleShift(lidarDepth: CVPixelBuffer, relativeDepth: [Float], relWidth: Int, relHeight: Int) -> (Float, Float) {
@@ -217,8 +510,12 @@ class ARDataManager: ObservableObject {
             let n = Double(count)
             let denom = n * sumXX - sumX * sumX
             if abs(denom) > 1e-6 {
-                let scale = Float((n * sumXY - sumX * sumY) / denom)
-                let shift = Float((sumY - scale * sumX) / n)
+                // Calculate scale and shift in Double precision first
+                let scaleDouble = (n * sumXY - sumX * sumY) / denom
+                let shiftDouble = (sumY - scaleDouble * sumX) / n
+                // Convert to Float at the end
+                let scale = Float(scaleDouble)
+                let shift = Float(shiftDouble)
                 
                 // Validate results
                 if scale > 0 && scale < 100 && abs(shift) < 10 {

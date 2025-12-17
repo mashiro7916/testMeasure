@@ -28,6 +28,18 @@ struct ContentView: View {
                     
                     Spacer()
                     
+                    // Toggle depth comparison view
+                    Button(action: {
+                        arManager.showDepthComparison.toggle()
+                    }) {
+                        Text(arManager.showDepthComparison ? "Hide Depth" : "Show Depth")
+                            .font(.caption)
+                            .foregroundColor(.white)
+                            .padding(8)
+                            .background(arManager.showDepthComparison ? Color.green : Color.blue)
+                            .cornerRadius(8)
+                    }
+                    
                     if arManager.selectedLineIndex >= 0 {
                         Text(String(format: "Length: %.2f cm", arManager.measuredLength * 100))
                             .font(.headline)
@@ -41,27 +53,105 @@ struct ContentView: View {
                 
                 Spacer()
                 
-                // Main display with line detection overlay
-                if let image = arManager.displayImage {
-                    GeometryReader { geometry in
-                        Image(uiImage: image)
-                            .resizable()
-                            .aspectRatio(contentMode: .fit)
-                            .frame(maxWidth: geometry.size.width, maxHeight: geometry.size.height * 0.6)
-                            .border(Color.white, width: 2)
-                            .gesture(
-                                DragGesture(minimumDistance: 0)
-                                    .onEnded { value in
-                                        // Handle tap to select line
-                                        let imageSize = CGSize(
-                                            width: geometry.size.width,
-                                            height: geometry.size.height * 0.6
-                                        )
-                                        arManager.selectLineNear(point: value.location, imageSize: imageSize)
+                // Depth comparison view
+                if arManager.showDepthComparison {
+                    ScrollView {
+                        VStack(spacing: 16) {
+                            // Aligned depth map
+                            if let alignedDepth = arManager.alignedDepthImage {
+                                VStack {
+                                    Text("Aligned Depth Map")
+                                        .font(.headline)
+                                        .foregroundColor(.white)
+                                    Image(uiImage: alignedDepth)
+                                        .resizable()
+                                        .aspectRatio(contentMode: .fit)
+                                        .frame(maxHeight: 200)
+                                        .border(Color.white, width: 2)
+                                }
+                                .padding()
+                                .background(Color.black.opacity(0.7))
+                                .cornerRadius(12)
+                            }
+                            
+                            // LiDAR depth map
+                            if let lidarDepth = arManager.lidarDepthImage {
+                                VStack {
+                                    Text("LiDAR Depth Map")
+                                        .font(.headline)
+                                        .foregroundColor(.white)
+                                    Image(uiImage: lidarDepth)
+                                        .resizable()
+                                        .aspectRatio(contentMode: .fit)
+                                        .frame(maxHeight: 200)
+                                        .border(Color.white, width: 2)
+                                }
+                                .padding()
+                                .background(Color.black.opacity(0.7))
+                                .cornerRadius(12)
+                            }
+                            
+                            // Error heat map
+                            if let errorMap = arManager.errorHeatMap {
+                                VStack {
+                                    Text("Error Heat Map")
+                                        .font(.headline)
+                                        .foregroundColor(.white)
+                                    Text("(Aligned - LiDAR)")
+                                        .font(.caption)
+                                        .foregroundColor(.gray)
+                                    Image(uiImage: errorMap)
+                                        .resizable()
+                                        .aspectRatio(contentMode: .fit)
+                                        .frame(maxHeight: 200)
+                                        .border(Color.white, width: 2)
+                                    HStack {
+                                        Text("Green = Low Error")
+                                            .font(.caption)
+                                            .foregroundColor(.green)
+                                        Spacer()
+                                        Text("Red = High Error")
+                                            .font(.caption)
+                                            .foregroundColor(.red)
                                     }
-                            )
+                                    .padding(.horizontal)
+                                }
+                                .padding()
+                                .background(Color.black.opacity(0.7))
+                                .cornerRadius(12)
+                            }
+                            
+                            if arManager.alignedDepthImage == nil && arManager.lidarDepthImage == nil {
+                                Text("Waiting for depth data...")
+                                    .foregroundColor(.gray)
+                                    .padding()
+                            }
+                        }
+                        .padding()
                     }
-                    .frame(height: 400)
+                } else {
+                    // Main display with line detection overlay
+                    if let image = arManager.displayImage {
+                        GeometryReader { geometry in
+                            Image(uiImage: image)
+                                .resizable()
+                                .aspectRatio(contentMode: .fit)
+                                .frame(maxWidth: geometry.size.width, maxHeight: geometry.size.height * 0.6)
+                                .border(Color.white, width: 2)
+                                .gesture(
+                                    DragGesture(minimumDistance: 0)
+                                        .onEnded { value in
+                                            // Handle tap to select line
+                                            let imageSize = CGSize(
+                                                width: geometry.size.width,
+                                                height: geometry.size.height * 0.6
+                                            )
+                                            arManager.selectLineNear(point: value.location, imageSize: imageSize)
+                                        }
+                                )
+                        }
+                        .frame(height: 400)
+                    }
                 }
                 
                 Spacer()
