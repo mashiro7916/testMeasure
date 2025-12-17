@@ -149,6 +149,7 @@ class ARDataManager: ObservableObject {
         let lidarHeight = CVPixelBufferGetHeight(lidarDepth)
         
         guard let lidarBase = CVPixelBufferGetBaseAddress(lidarDepth) else {
+            print("DEBUG: Failed to get LiDAR base address")
             return (1.0, 0.0)
         }
         
@@ -163,27 +164,40 @@ class ARDataManager: ObservableObject {
         var count: Int = 0
         
         // Sample points from LiDAR depth map
-        let sampleStep = 4  // Sample every 4th pixel for speed
+        // Use adaptive sampling: more samples for better accuracy
+        let sampleStep = 2  // Sample every 2nd pixel for better accuracy
         
         for ly in stride(from: 0, to: lidarHeight, by: sampleStep) {
             for lx in stride(from: 0, to: lidarWidth, by: sampleStep) {
-                let lidarIdx = ly * (lidarBytesPerRow / MemoryLayout<Float32>.size) + lx
+                let lidarRowBytes = lidarBytesPerRow / MemoryLayout<Float32>.size
+                let lidarIdx = ly * lidarRowBytes + lx
+                
+                guard lidarIdx >= 0 && lidarIdx < (lidarHeight * lidarRowBytes) else {
+                    continue
+                }
+                
                 let lidarValue = lidarBuffer[lidarIdx]
                 
-                // Skip invalid depth values
-                if lidarValue <= 0 || lidarValue > 10 || lidarValue.isNaN || lidarValue.isInfinite {
+                // Skip invalid depth values (LiDAR typically has range 0.1m - 10m)
+                if lidarValue <= 0.05 || lidarValue > 10.0 || lidarValue.isNaN || lidarValue.isInfinite {
                     continue
                 }
                 
                 // Map LiDAR coordinates to relative depth coordinates
+                // Both are in camera space, so simple linear mapping should work
                 let rx = Int(Float(lx) / Float(lidarWidth) * Float(relWidth))
                 let ry = Int(Float(ly) / Float(lidarHeight) * Float(relHeight))
                 
                 if rx >= 0 && rx < relWidth && ry >= 0 && ry < relHeight {
                     let relIdx = ry * relWidth + rx
+                    
+                    guard relIdx < relativeDepth.count else {
+                        continue
+                    }
+                    
                     let relValue = relativeDepth[relIdx]
                     
-                    if !relValue.isNaN && !relValue.isInfinite {
+                    if !relValue.isNaN && !relValue.isInfinite && relValue > 0 {
                         sumX += Double(relValue)
                         sumY += Double(lidarValue)
                         sumXX += Double(relValue) * Double(relValue)
@@ -194,15 +208,28 @@ class ARDataManager: ObservableObject {
             }
         }
         
+        print("DEBUG: Depth alignment - collected \(count) valid point pairs")
+        
         // Least squares: y = scale * x + shift
-        if count > 10 {
+        // Solving: scale = (n*sumXY - sumX*sumY) / (n*sumXX - sumX*sumX)
+        //          shift = (sumY - scale*sumX) / n
+        if count > 20 {  // Need at least 20 points for reliable estimation
             let n = Double(count)
             let denom = n * sumXX - sumX * sumX
             if abs(denom) > 1e-6 {
                 let scale = Float((n * sumXY - sumX * sumY) / denom)
                 let shift = Float((sumY - scale * sumX) / n)
-                return (scale, shift)
+                
+                // Validate results
+                if scale > 0 && scale < 100 && abs(shift) < 10 {
+                    print("DEBUG: Depth alignment successful - scale: \(scale), shift: \(shift), samples: \(count)")
+                    return (scale, shift)
+                } else {
+                    print("DEBUG: Depth alignment produced invalid values - scale: \(scale), shift: \(shift)")
+                }
             }
+        } else {
+            print("DEBUG: Insufficient samples for depth alignment (\(count) < 20)")
         }
         
         return (1.0, 0.0)
@@ -285,15 +312,24 @@ class ARDataManager: ObservableObject {
     
     func selectLineNear(point: CGPoint, imageSize: CGSize) {
         // Find the closest line to the tap point
+        // Note: detectedLines coordinates are in original image space, not depth map space
         var minDistance: Float = Float.greatestFiniteMagnitude
         var closestIndex = -1
         
-        // Scale point to depth map coordinates
-        let scaleX = Float(depthWidth) / Float(imageSize.width)
-        let scaleY = Float(depthHeight) / Float(imageSize.height)
-        let scaledPoint = CGPoint(x: CGFloat(Float(point.x) * scaleX), y: CGFloat(Float(point.y) * scaleY))
+        // Get current lines (thread-safe access)
+        let currentLines = detectedLines
         
-        for (index, line) in detectedLines.enumerated() {
+        // Calculate scale from displayed image to original image
+        // The displayed image might be scaled, so we need to account for that
+        // For simplicity, assume the image is displayed at its original size or scaled proportionally
+        let scaleX = Float(imageResolution.width) / Float(imageSize.width)
+        let scaleY = Float(imageResolution.height) / Float(imageSize.height)
+        let scaledPoint = CGPoint(
+            x: CGFloat(Float(point.x) * scaleX),
+            y: CGFloat(Float(point.y) * scaleY)
+        )
+        
+        for (index, line) in currentLines.enumerated() {
             let distance = pointToLineDistance(
                 point: scaledPoint,
                 x1: line.x1, y1: line.y1,
@@ -306,8 +342,10 @@ class ARDataManager: ObservableObject {
             }
         }
         
-        // Select if close enough (within 30 pixels)
-        if closestIndex >= 0 && minDistance < 30 {
+        // Select if close enough (within 50 pixels in original image space)
+        // Convert threshold to original image space
+        let threshold = Float(50.0) * max(scaleX, scaleY)
+        if closestIndex >= 0 && minDistance < threshold {
             selectLine(at: closestIndex)
         }
     }
@@ -336,14 +374,17 @@ class ARDataManager: ObservableObject {
     private func calculate3DLength(line: DetectedLine) -> Float {
         guard let depthMap = absoluteDepthMap,
               let intrinsics = cameraIntrinsics,
-              depthWidth > 0 && depthHeight > 0 else {
+              depthWidth > 0 && depthHeight > 0,
+              imageResolution.width > 0 && imageResolution.height > 0 else {
+            print("DEBUG: Cannot calculate 3D length - missing data")
             return 0
         }
         
-        // Scale line coordinates to depth map resolution
+        // Scale line coordinates from original image to depth map resolution
         let scaleX = Float(depthWidth) / Float(imageResolution.width)
         let scaleY = Float(depthHeight) / Float(imageResolution.height)
         
+        // Map line endpoints to depth map coordinates
         let dx1 = Int(line.x1 * scaleX)
         let dy1 = Int(line.y1 * scaleY)
         let dx2 = Int(line.x2 * scaleX)
@@ -356,16 +397,38 @@ class ARDataManager: ObservableObject {
         let clampedY2 = max(0, min(depthHeight - 1, dy2))
         
         // Get depth values at endpoints
-        let depth1 = depthMap[clampedY1 * depthWidth + clampedX1]
-        let depth2 = depthMap[clampedY2 * depthWidth + clampedX2]
+        let idx1 = clampedY1 * depthWidth + clampedX1
+        let idx2 = clampedY2 * depthWidth + clampedX2
+        
+        guard idx1 < depthMap.count && idx2 < depthMap.count else {
+            print("DEBUG: Depth map index out of range - idx1: \(idx1), idx2: \(idx2), count: \(depthMap.count)")
+            return 0
+        }
+        
+        let depth1 = depthMap[idx1]
+        let depth2 = depthMap[idx2]
+        
+        // Skip if depth values are invalid
+        if depth1 <= 0 || depth2 <= 0 || depth1.isNaN || depth2.isNaN || depth1.isInfinite || depth2.isInfinite {
+            print("DEBUG: Invalid depth values - D1: \(depth1)m, D2: \(depth2)m")
+            return 0
+        }
         
         // Scale intrinsics to depth map resolution
+        // Camera intrinsics are in original image coordinates, need to scale to depth map
         let fx = intrinsics[0][0] * scaleX
         let fy = intrinsics[1][1] * scaleY
         let cx = intrinsics[2][0] * scaleX
         let cy = intrinsics[2][1] * scaleY
         
-        // Unproject to 3D
+        // Validate intrinsics
+        guard fx > 0 && fy > 0 else {
+            print("DEBUG: Invalid camera intrinsics - fx: \(fx), fy: \(fy)")
+            return 0
+        }
+        
+        // Unproject 2D points to 3D using camera intrinsics
+        // Formula: X = (u - cx) * Z / fx, Y = (v - cy) * Z / fy, Z = depth
         let x1_3d = (Float(clampedX1) - cx) * depth1 / fx
         let y1_3d = (Float(clampedY1) - cy) * depth1 / fy
         let z1_3d = depth1
@@ -382,7 +445,7 @@ class ARDataManager: ObservableObject {
         let length = sqrtf(dx * dx + dy * dy + dz * dz)
         
         print("DEBUG: 3D points - P1(\(x1_3d), \(y1_3d), \(z1_3d)) P2(\(x2_3d), \(y2_3d), \(z2_3d))")
-        print("DEBUG: Depths - D1: \(depth1)m, D2: \(depth2)m")
+        print("DEBUG: Depths - D1: \(depth1)m, D2: \(depth2)m, Length: \(length)m")
         
         return length
     }
