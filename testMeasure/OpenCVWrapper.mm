@@ -5,20 +5,34 @@
 //  OpenCV wrapper implementation
 //
 
-#import "OpenCVWrapper.h"
-
 #ifdef __cplusplus
+// IMPORTANT: OpenCV headers must be imported BEFORE any other headers
+// This prevents Objective-C keyword conflicts (blenders, exposure_compensate, seam_finders)
+
+// Disable problematic OpenCV stitching module
+#define HAVE_OPENCV_STITCHING 0
+
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdocumentation"
 #pragma clang diagnostic ignored "-Wunused-parameter"
 
-// OpenCV 4.12 for iOS
-// Make sure opencv2.framework is added to the project and Framework Search Paths is set
-#import <opencv2/opencv.hpp>
+// OpenCV 4.12 for iOS - import BEFORE standard headers
+// IMPORTANT: Make sure in Xcode Build Settings:
+// 1. Framework Search Paths includes: $(PROJECT_DIR) (recursive)
+// 2. Header Search Paths includes: $(PROJECT_DIR)/opencv2.framework/Headers (recursive)
+// 3. opencv2.framework is added to "Link Binary With Libraries" in Build Phases
+
+// Import only required modules (avoid opencv.hpp which includes stitching)
+#import <opencv2/core.hpp>
+#import <opencv2/imgproc.hpp>
+#import <opencv2/imgcodecs.hpp>
 #import <opencv2/imgcodecs/ios.h>
 
 #pragma clang diagnostic pop
 #endif
+
+// Import standard headers AFTER OpenCV
+#import "OpenCVWrapper.h"
 
 @implementation LineSegment
 @end
