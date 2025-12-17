@@ -105,57 +105,37 @@ struct ARViewContainer: UIViewRepresentable {
             arView.scene.addAnchor(newCameraAnchor)
             cameraAnchor = newCameraAnchor
             
-            // TEST: Add simple test lines at fixed positions to verify rendering
-            // Create 3 test lines in front of camera
-            let testLines: [(start: simd_float3, end: simd_float3)] = [
-                // Horizontal line (left to right)
-                (simd_float3(-0.2, 0, -0.5), simd_float3(0.2, 0, -0.5)),
-                // Vertical line (bottom to top)
-                (simd_float3(0, -0.2, -0.5), simd_float3(0, 0.2, -0.5)),
-                // Diagonal line
-                (simd_float3(-0.15, -0.15, -0.5), simd_float3(0.15, 0.15, -0.5))
-            ]
-            
-            for (index, testLine) in testLines.enumerated() {
-                let testLineEntity = createLineEntity(from: testLine.start, to: testLine.end, color: .yellow)
-                newCameraAnchor.addChild(testLineEntity)
-                print("DEBUG: Added test line \(index) from \(testLine.start) to \(testLine.end)")
-            }
-            
-            print("DEBUG: Added \(testLines.count) test yellow lines at fixed positions")
-            
             // Create 3D line entities for each detected line
             // IMPORTANT: RealityKit uses different coordinate system than ARKit camera coordinates
-            // ARKit camera: X right, Y up, Z forward
+            // ARKit camera: X right, Y up, Z forward (positive Z is forward)
             // RealityKit camera anchor: X right, Y up, Z backward (negative Z is forward)
             var entityCount = 0
             for (index, line) in lines.enumerated() {
+                // Get original ARKit camera coordinates (Z is positive forward)
+                let originalZ1 = line.point3D1.z
+                let originalZ2 = line.point3D2.z
+                
+                // Validate original depth first (before conversion)
+                if originalZ1 <= 0 || originalZ2 <= 0 || originalZ1 > 10.0 || originalZ2 > 10.0 {
+                    print("DEBUG: Line \(index) has invalid depth (z1=\(originalZ1), z2=\(originalZ2)), skipping")
+                    continue
+                }
+                
+                if originalZ1 < 0.1 || originalZ2 < 0.1 {
+                    print("DEBUG: Line \(index) too close to camera (z < 0.1m), skipping")
+                    continue
+                }
+                
                 // Convert from ARKit camera coordinates to RealityKit coordinates
                 // In RealityKit, negative Z is forward, so we need to negate Z
                 let point1 = simd_float3(line.point3D1.x, line.point3D1.y, -line.point3D1.z)
                 let point2 = simd_float3(line.point3D2.x, line.point3D2.y, -line.point3D2.z)
                 
-                // Check if points are in valid range (Z should be positive and reasonable)
-                let z1 = point1.z
-                let z2 = point2.z
+                print("DEBUG: Line \(index): original p1=\(line.point3D1), p2=\(line.point3D2), converted p1=\(point1), p2=\(point2), length=\(line.length3D)m")
                 
-                print("DEBUG: Line \(index): p1=\(point1), p2=\(point2), length=\(line.length3D)m, z1=\(z1)m, z2=\(z2)m")
+                print("DEBUG: Line \(index) passed validation, creating entity with converted p1=\(point1), p2=\(point2)")
                 
-                // Skip if depth is invalid or too far
-                if z1 <= 0 || z2 <= 0 || z1 > 10.0 || z2 > 10.0 {
-                    print("DEBUG: Line \(index) has invalid depth, skipping")
-                    continue
-                }
-                
-                // Verify points are in front of camera (Z should be positive in camera coordinate system)
-                if point1.z < 0.1 || point2.z < 0.1 {
-                    print("DEBUG: Line \(index) too close to camera (z < 0.1m), skipping")
-                    continue
-                }
-                
-                print("DEBUG: Line \(index) passed validation, creating entity with p1=\(point1), p2=\(point2)")
-                
-                // Create line entity
+                // Create line entity (YELLOW for detected lines)
                 let lineEntity = createLineEntity(from: point1, to: point2, color: .yellow)
                 
                 // Check if entity was created successfully
