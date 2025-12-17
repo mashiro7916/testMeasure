@@ -32,6 +32,11 @@ struct ARViewContainer: UIViewRepresentable {
         // Store ARView reference in coordinator
         context.coordinator.arView = arView
         
+        // Initial update
+        DispatchQueue.main.async {
+            context.coordinator.updateLines(arManager.detectedLines, frame: arManager.currentFrame)
+        }
+        
         return arView
     }
     
@@ -40,8 +45,10 @@ struct ARViewContainer: UIViewRepresentable {
         let currentLines = arManager.detectedLines
         let currentFrame = arManager.currentFrame
         
-        // Check if lines have changed
-        if currentLines.count != context.coordinator.lastLineCount {
+        print("DEBUG: updateUIView called, detectedLines count: \(currentLines.count), lastLineCount: \(context.coordinator.lastLineCount)")
+        
+        // Always update if lines have changed or if this is the first update
+        if currentLines.count != context.coordinator.lastLineCount || context.coordinator.lastLineCount == -1 {
             context.coordinator.lastLineCount = currentLines.count
             context.coordinator.updateLines(currentLines, frame: currentFrame)
         }
@@ -64,6 +71,15 @@ struct ARViewContainer: UIViewRepresentable {
         func session(_ session: ARSession, didUpdate frame: ARFrame) {
             // Capture RGB image and depth data continuously
             arManager.captureFrame(frame: frame)
+            
+            // Check if lines have changed and update if needed
+            let currentLines = arManager.detectedLines
+            if currentLines.count != lastLineCount {
+                lastLineCount = currentLines.count
+                DispatchQueue.main.async { [weak self] in
+                    self?.updateLines(currentLines, frame: frame)
+                }
+            }
         }
         
         func updateLines(_ lines: [DetectedLine], frame: ARFrame?) {
@@ -72,7 +88,7 @@ struct ARViewContainer: UIViewRepresentable {
                 return
             }
             
-            print("DEBUG: updateLines called with \(lines.count) lines")
+            print("DEBUG: updateLines called with \(lines.count) lines, frame: \(frame != nil ? "available" : "nil")")
             
             // Remove old anchor if exists
             if let oldAnchor = cameraAnchor {
