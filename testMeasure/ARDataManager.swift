@@ -22,6 +22,9 @@ class ARDataManager: ObservableObject {
     private var lastSaveTime: TimeInterval = 0
     private let minSaveInterval: TimeInterval = 1.0  // Minimum 1 second between saves
     
+    // Published property for displaying OpenCV grayscale image
+    @Published var opencvGrayscaleImage: UIImage?
+    
     init() {
         setupDirectory()
     }
@@ -72,6 +75,15 @@ class ARDataManager: ObservableObject {
         guard let rgbBuffer = convertYUVToRGB(pixelBuffer) else {
             print("DEBUG: Failed to convert YUV to RGB")
             return
+        }
+        
+        // OpenCV grayscale test - convert RGB to grayscale and display (not save)
+        if let rgbImage = pixelBufferToUIImage(rgbBuffer) {
+            let grayImage = OpenCVWrapper.convertToGrayscale(rgbImage)
+            DispatchQueue.main.async { [weak self] in
+                self?.opencvGrayscaleImage = grayImage
+                print("DEBUG: OpenCV grayscale image updated, OpenCV version: \(OpenCVWrapper.openCVVersion())")
+            }
         }
         
         // Estimate depth using Core ML model with RGB input
@@ -459,5 +471,15 @@ class ARDataManager: ObservableObject {
                 }
             }
         }
+    }
+    
+    // Helper function to convert CVPixelBuffer to UIImage
+    private func pixelBufferToUIImage(_ pixelBuffer: CVPixelBuffer) -> UIImage? {
+        let ciImage = CIImage(cvPixelBuffer: pixelBuffer)
+        let context = CIContext()
+        guard let cgImage = context.createCGImage(ciImage, from: ciImage.extent) else {
+            return nil
+        }
+        return UIImage(cgImage: cgImage)
     }
 }
