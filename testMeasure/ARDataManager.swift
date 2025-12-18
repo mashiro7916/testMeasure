@@ -155,9 +155,19 @@ class ARDataManager: ObservableObject {
             return
         }
         
+        // Filter lines by 2D pixel length (remove lines shorter than 100 pixels)
+        let filteredLines = lines.filter { line in
+            let dx = Float(line.x2 - line.x1)
+            let dy = Float(line.y2 - line.y1)
+            let length2D = sqrtf(dx * dx + dy * dy)
+            return length2D >= 100.0
+        }
+        
+        print("DEBUG: Filtered \(lines.count - filteredLines.count) lines with 2D length < 100 pixels, remaining \(filteredLines.count) lines")
+        
         // Convert to Swift struct and calculate 3D distances
         var swiftLines: [DetectedLine] = []
-        for (index, line) in lines.enumerated() {
+        for (index, line) in filteredLines.enumerated() {
             // Convert rotated coordinates back to original image coordinates
             // If image was rotated 90° counterclockwise: (x_rot, y_rot) -> (y_rot, originalWidth - x_rot)
             let origX1 = line.y1
